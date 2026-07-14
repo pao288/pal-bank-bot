@@ -1,14 +1,11 @@
-import os
 import logging
-import uuid
+import os
 
 import discord
 from discord.ext import commands
 
-from db import init_db_pool
-from views import BankPanelView
-from accounts import ensure_user_accounts
-from transactions import transfer, get_user_account_id, InsufficientBalanceError, AlreadyProcessedError
+from db import get_pool, init_db_pool
+from views import AdminPanelView, BankPanelView, EnvelopeClaimView
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pal_bank")
@@ -20,64 +17,52 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+async def restore_envelope_views():
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT envelope_id
+            FROM bank.pal_envelopes
+            WHERE status='ACTIVE'
+            """
+        )
+    for row in rows:
+        bot.add_view(EnvelopeClaimView(row["envelope_id"]))
+
+
 @bot.event
 async def on_ready():
     bot.add_view(BankPanelView())
-    logger.info(f"PAL BANK BOT起動完了: {bot.user}")
+    bot.add_view(AdminPanelView())
+    await restore_envelope_views()
+    logger.info("PAL BANK BOT起動完了: %s", bot.user)
 
 
+# 固定パネルの初回設置用。通常ユーザーはコマンド操作しない。
 @bot.command(name="bankpanel")
 @commands.has_permissions(administrator=True)
 async def bankpanel(ctx: commands.Context):
-    embed = discord.Embed(title="🏦 PAL BANK")
+    embed = discord.Embed(
+        title="🏦 PAL BANK",
+        description="下のボタンからBANK機能を利用できます。",
+    )
     await ctx.send(embed=embed, view=BankPanelView())
 
 
-@bot.command(name="grant")
+@bot.command(name="adminpanel")
 @commands.has_permissions(administrator=True)
-async def grant(ctx: commands.Context, member: discord.Member, currency: str, amount: int):
-    """管理者用: 指定ユーザーへPALまたはCHIPを付与する"""
-    currency = currency.upper()
-
-    if currency not in ("PAL", "CHIP"):
-        await ctx.send("通貨はPALかCHIPのみ指定できます。")
-        return
-
-    if amount <= 0:
-        await ctx.send("金額は1以上の整数で指定してください。")
-        return
-
-    user_id = str(member.id)
-    await ensure_user_accounts(user_id)
-    to_account_id = await get_user_account_id(user_id, currency)
-
-    idempotency_key = f"ADMIN_GRANT:{uuid.uuid4()}"
-
-    try:
-        await transfer(
-            idempotency_key=idempotency_key,
-            transaction_type="ADMIN_GRANT",
-            currency=currency,
-            from_account_id=None,
-            to_account_id=to_account_id,
-            amount=amount,
-            external_bot="ADMIN",
-            external_reference_id=idempotency_key,
-        )
-    except AlreadyProcessedError:
-        await ctx.send("この処理はすでに実行済みです。")
-        return
-    except InsufficientBalanceError:
-        await ctx.send("残高処理でエラーが発生しました。")
-        return
-
-    await ctx.send(f"✅ {member.mention} に {amount:,} {currency} を付与しました。")
+async def adminpanel(ctx: commands.Context):
+    embed = discord.Embed(
+        title="🔧 PAL BANK 管理パネル",
+        description="管理操作を選択してください。",
+    )
+    await ctx.send(embed=embed, view=AdminPanelView())
 
 
 async def main():
     await init_db_pool()
     logger.info("DB接続・schema確認完了")
-
     async with bot:
         await bot.start(os.environ["DISCORD_TOKEN"])
 

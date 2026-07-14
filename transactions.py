@@ -1,3 +1,4 @@
+import json
 from db import get_pool
 
 
@@ -6,7 +7,6 @@ class InsufficientBalanceError(Exception):
 
 
 class AlreadyProcessedError(Exception):
-    """同一idempotency_keyで既にCOMPLETED済みの場合"""
     pass
 
 
@@ -19,29 +19,29 @@ async def transfer(
     amount: int,
     external_bot: str | None = None,
     external_reference_id: str | None = None,
+    metadata: dict | None = None,
 ) -> dict:
-    """
-    口座間で通貨を移動させる中心処理。
-    from_account_id が None の場合は「付与のみ」(残高チェックなし)。
-    to_account_id が None の場合は「減算のみ」。
-    同一 idempotency_key の COMPLETED 処理は再実行しない。
-    """
-    pool = get_pool()
+    if amount <= 0:
+        raise ValueError("amount must be positive")
 
+    currency = currency.upper()
+    if currency not in ("PAL", "CHIP"):
+        raise ValueError("invalid currency")
+
+    pool = get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             existing = await conn.fetchrow(
                 """
-                SELECT status FROM bank.transactions
+                SELECT status
+                FROM bank.transactions
                 WHERE idempotency_key = $1
-                FOR UPDATE;
+                FOR UPDATE
                 """,
                 idempotency_key,
             )
-
-            if existing is not None:
-                if existing["status"] == "COMPLETED":
-                    raise AlreadyProcessedError(idempotency_key)
+            if existing is not None and existing["status"] == "COMPLETED":
+                raise AlreadyProcessedError(idempotency_key)
 
             if existing is None:
                 await conn.execute(
@@ -49,58 +49,54 @@ async def transfer(
                     INSERT INTO bank.transactions (
                         idempotency_key, transaction_type, currency,
                         from_account_id, to_account_id, amount,
-                        external_bot, external_reference_id, status
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING');
+                        external_bot, external_reference_id, status, metadata
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'PENDING',$9::jsonb)
                     """,
-                    idempotency_key, transaction_type, currency,
-                    from_account_id, to_account_id, amount,
-                    external_bot, external_reference_id,
+                    idempotency_key,
+                    transaction_type,
+                    currency,
+                    from_account_id,
+                    to_account_id,
+                    amount,
+                    external_bot,
+                    external_reference_id,
+                    json.dumps(metadata or {}),
                 )
 
             if from_account_id is not None:
-                account = await conn.fetchrow(
-                    """
-                    SELECT balance FROM bank.accounts
-                    WHERE account_id = $1
-                    FOR UPDATE;
-                    """,
-                    from_account_id,
-                )
-                if account is None or account["balance"] < amount:
-                    await conn.execute(
-                        """
-                        UPDATE bank.transactions
-                        SET status = 'FAILED', failed_at = now()
-                        WHERE idempotency_key = $1;
-                        """,
-                        idempotency_key,
-                    )
-                    raise InsufficientBalanceError(idempotency_key)
-
-                await conn.execute(
+                changed = await conn.fetchval(
                     """
                     UPDATE bank.accounts
                     SET balance = balance - $1, updated_at = now()
-                    WHERE account_id = $2;
+                    WHERE account_id = $2 AND balance >= $1
+                    RETURNING account_id
                     """,
-                    amount, from_account_id,
+                    amount,
+                    from_account_id,
                 )
+                if changed is None:
+                    raise InsufficientBalanceError(idempotency_key)
 
             if to_account_id is not None:
-                await conn.execute(
+                changed = await conn.fetchval(
                     """
                     UPDATE bank.accounts
                     SET balance = balance + $1, updated_at = now()
-                    WHERE account_id = $2;
+                    WHERE account_id = $2
+                    RETURNING account_id
                     """,
-                    amount, to_account_id,
+                    amount,
+                    to_account_id,
                 )
+                if changed is None:
+                    raise RuntimeError("destination account not found")
 
             await conn.execute(
                 """
                 UPDATE bank.transactions
                 SET status = 'COMPLETED', completed_at = now()
-                WHERE idempotency_key = $1;
+                WHERE idempotency_key = $1
                 """,
                 idempotency_key,
             )
@@ -108,14 +104,51 @@ async def transfer(
     return {"status": "SUCCESS", "idempotency_key": idempotency_key}
 
 
-async def get_user_account_id(user_id: str, currency: str) -> int | None:
+async def get_history(user_id: str, limit: int = 100) -> list:
     pool = get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
+        return await conn.fetch(
             """
-            SELECT account_id FROM bank.accounts
-            WHERE account_type = 'USER' AND owner_id = $1 AND currency = $2;
+            SELECT
+                t.bank_transaction_id,
+                t.transaction_type,
+                t.currency,
+                t.amount,
+                t.status,
+                t.created_at,
+                fa.owner_id AS from_owner_id,
+                ta.owner_id AS to_owner_id
+            FROM bank.transactions t
+            LEFT JOIN bank.accounts fa ON fa.account_id = t.from_account_id
+            LEFT JOIN bank.accounts ta ON ta.account_id = t.to_account_id
+            WHERE fa.owner_id = $1 OR ta.owner_id = $1
+            ORDER BY t.bank_transaction_id DESC
+            LIMIT $2
             """,
-            user_id, currency,
+            user_id,
+            limit,
         )
-    return row["account_id"] if row else None
+
+
+async def get_all_history(limit: int = 100) -> list:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT
+                t.bank_transaction_id,
+                t.transaction_type,
+                t.currency,
+                t.amount,
+                t.status,
+                t.created_at,
+                fa.owner_id AS from_owner_id,
+                ta.owner_id AS to_owner_id
+            FROM bank.transactions t
+            LEFT JOIN bank.accounts fa ON fa.account_id = t.from_account_id
+            LEFT JOIN bank.accounts ta ON ta.account_id = t.to_account_id
+            ORDER BY t.bank_transaction_id DESC
+            LIMIT $1
+            """,
+            limit,
+        )

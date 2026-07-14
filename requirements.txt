@@ -1,2 +1,2 @@
-discord.py
-asyncpg
+discord.py>=2.5,<3
+asyncpg>=0.30,<1
