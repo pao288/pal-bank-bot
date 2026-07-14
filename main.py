@@ -44,9 +44,18 @@ async def on_ready():
 @commands.has_permissions(administrator=True)
 async def bankpanel(ctx: commands.Context):
     embed = discord.Embed(
-        title="🏦 PAL BANK",
-        description="下のボタンからBANK機能を利用できます。",
+        title="🏦 PAL BANK｜DIGITAL WALLET",
+        description=(
+            "**PALとCHIPを、ここから管理。**\n\n"
+            "💰 **残高確認**　現在のPAL / CHIPを表示\n"
+            "💸 **送金**　ユーザーへPALを送金\n"
+            "🧧 **ポチ袋作成**　PALをランダム配布\n"
+            "📖 **取引履歴**　最新の入出金を確認\n\n"
+            "操作したい機能を下のボタンから選択してください。"
+        ),
+        color=0x5865F2,
     )
+    embed.set_footer(text="PAL BANK • Secure PAL & CHIP Wallet")
     await ctx.send(embed=embed, view=BankPanelView())
 
 
@@ -54,9 +63,16 @@ async def bankpanel(ctx: commands.Context):
 @commands.has_permissions(administrator=True)
 async def adminpanel(ctx: commands.Context):
     embed = discord.Embed(
-        title="🔧 PAL BANK 管理パネル",
-        description="管理操作を選択してください。",
+        title="🔧 PAL BANK｜ADMIN CONSOLE",
+        description=(
+            "**BANK管理者専用コンソール**\n\n"
+            "PAL / CHIPの付与・回収、ユーザー残高照会、"
+            "BANK全体の取引履歴を管理できます。\n\n"
+            "実行する管理操作を下のボタンから選択してください。"
+        ),
+        color=0x2B2D31,
     )
+    embed.set_footer(text="PAL BANK • Administrator Console")
     await ctx.send(embed=embed, view=AdminPanelView())
 
 

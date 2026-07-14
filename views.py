@@ -5,6 +5,19 @@ import discord
 
 from accounts import ensure_user_accounts, get_user_account_id, get_user_balances
 from db import get_pool
+PAL_BLUE = 0x5865F2
+PAL_GREEN = 0x57F287
+PAL_GOLD = 0xFEE75C
+PAL_RED = 0xED4245
+PAL_DARK = 0x2B2D31
+
+
+def bank_embed(title: str, description: str | None = None, color: int = PAL_BLUE) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text="PAL BANK • Secure PAL & CHIP Wallet")
+    return embed
+
+
 from transactions import (
     AlreadyProcessedError,
     InsufficientBalanceError,
@@ -19,7 +32,7 @@ def money(value: int, currency: str) -> str:
 
 
 def history_embed(title: str, rows: list, viewer_id: str | None = None) -> discord.Embed:
-    embed = discord.Embed(title=title)
+    embed = bank_embed(title, color=PAL_DARK)
     if not rows:
         embed.description = "取引履歴はありません。"
         return embed
@@ -93,7 +106,7 @@ class TransferAmountModal(discord.ui.Modal, title="💸 送金"):
             await interaction.response.send_message("PAL残高が足りません。", ephemeral=True)
             return
 
-        embed = discord.Embed(title="✅ 送金完了")
+        embed = bank_embed("✅ 送金完了", color=PAL_GREEN)
         embed.description = f"{self.target.mention} に **{amount:,} PAL** 送金しました。"
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -218,7 +231,7 @@ class EnvelopeModal(discord.ui.Modal, title="🧧 PALポチ袋作成"):
             await interaction.response.send_message("PAL残高が足りません。", ephemeral=True)
             return
 
-        embed = discord.Embed(title="🧧 PALポチ袋")
+        embed = bank_embed("🧧 PALポチ袋", color=PAL_GOLD)
         embed.description = (
             f"{interaction.user.mention} がポチ袋を作成しました！\n"
             f"**合計 {total:,} PAL / {claims}人**\n"
@@ -388,9 +401,9 @@ class BankPanelView(discord.ui.View):
     @discord.ui.button(label="💰 残高確認", style=discord.ButtonStyle.primary, custom_id="bank_check_balance", row=0)
     async def check_balance(self, interaction: discord.Interaction, button: discord.ui.Button):
         balances = await get_user_balances(str(interaction.user.id))
-        embed = discord.Embed(title="🏦 あなたの口座")
-        embed.add_field(name="💰 PAL", value=money(balances["PAL"], "PAL"), inline=False)
-        embed.add_field(name="🎰 CHIP", value=money(balances["CHIP"], "CHIP"), inline=False)
+        embed = bank_embed("🏦 PAL BANK｜MY ACCOUNT", "あなた専用の口座情報です。", PAL_BLUE)
+        embed.add_field(name="💰 PAL BALANCE", value=f"**{money(balances['PAL'], 'PAL')}**", inline=True)
+        embed.add_field(name="🎰 CHIP BALANCE", value=f"**{money(balances['CHIP'], 'CHIP')}**", inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="💸 送金", style=discord.ButtonStyle.secondary, custom_id="bank_transfer", row=0)
@@ -467,9 +480,9 @@ class AdminTargetSelect(discord.ui.UserSelect):
         target = self.values[0]
         if self.mode == "BALANCE":
             balances = await get_user_balances(str(target.id))
-            embed = discord.Embed(title=f"🏦 {target.display_name} の残高")
-            embed.add_field(name="PAL", value=money(balances["PAL"], "PAL"), inline=False)
-            embed.add_field(name="CHIP", value=money(balances["CHIP"], "CHIP"), inline=False)
+            embed = bank_embed(f"🏦 USER ACCOUNT｜{target.display_name}", "管理者用残高照会", PAL_DARK)
+            embed.add_field(name="💰 PAL", value=f"**{money(balances['PAL'], 'PAL')}**", inline=True)
+            embed.add_field(name="🎰 CHIP", value=f"**{money(balances['CHIP'], 'CHIP')}**", inline=True)
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
