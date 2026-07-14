@@ -10,6 +10,7 @@ async def init_db_pool() -> asyncpg.Pool:
         dsn=os.environ["DATABASE_URL"],
         min_size=1,
         max_size=10,
+        command_timeout=30,
     )
     async with _pool.acquire() as conn:
         await _create_schema(conn)
@@ -56,7 +57,7 @@ async def _create_schema(conn: asyncpg.Connection) -> None:
         external_bot TEXT,
         external_reference_id TEXT,
         status TEXT NOT NULL CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED', 'REFUNDED')),
-        metadata JSONB,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         completed_at TIMESTAMPTZ,
         failed_at TIMESTAMPTZ
@@ -131,3 +132,28 @@ async def _create_schema(conn: asyncpg.Connection) -> None:
         ('SYSTEM', 'VOICE_ROOM', 'PAL', 0)
     ON CONFLICT DO NOTHING;
     """)
+
+
+async def get_setting(key: str, default: str | None = None) -> str | None:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        value = await conn.fetchval(
+            "SELECT setting_value FROM bank.settings WHERE setting_key=$1",
+            key,
+        )
+    return value if value is not None else default
+
+
+async def set_setting(key: str, value: str) -> None:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bank.settings(setting_key, setting_value, updated_at)
+            VALUES ($1,$2,now())
+            ON CONFLICT(setting_key)
+            DO UPDATE SET setting_value=EXCLUDED.setting_value, updated_at=now()
+            """,
+            key,
+            value,
+        )

@@ -25,29 +25,30 @@ async def get_user_balances(user_id: str) -> dict[str, int]:
             """
             SELECT currency, balance
             FROM bank.accounts
-            WHERE account_type = 'USER' AND owner_id = $1
+            WHERE account_type='USER' AND owner_id=$1
             """,
             user_id,
         )
-    balances = {"PAL": 0, "CHIP": 0}
+    result = {"PAL": 0, "CHIP": 0}
     for row in rows:
-        balances[row["currency"]] = row["balance"]
-    return balances
+        result[row["currency"]] = row["balance"]
+    return result
 
 
 async def get_user_account_id(user_id: str, currency: str) -> int:
+    currency = currency.upper()
     await ensure_user_accounts(user_id)
     pool = get_pool()
     async with pool.acquire() as conn:
-        value = await conn.fetchval(
+        account_id = await conn.fetchval(
             """
             SELECT account_id
             FROM bank.accounts
-            WHERE account_type = 'USER' AND owner_id = $1 AND currency = $2
+            WHERE account_type='USER' AND owner_id=$1 AND currency=$2
             """,
             user_id,
-            currency.upper(),
+            currency,
         )
-    if value is None:
+    if account_id is None:
         raise RuntimeError("Account not found")
-    return value
+    return account_id
