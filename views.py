@@ -4,8 +4,9 @@ import uuid
 import discord
 
 from accounts import ensure_user_accounts, get_user_account_id, get_user_balances
-from db import get_pool
+from db import get_pool, get_setting, set_setting
 from transactions import InsufficientBalanceError, get_all_history, get_history, transfer
+from bank_services import exchange, totals
 
 PAL_BLUE = 0x5865F2
 PAL_GREEN = 0x57F287
@@ -308,7 +309,7 @@ class EnvelopeClaimView(discord.ui.View):
                 pass
 
 
-class BankPanelView(discord.ui.View):
+class LegacyBankPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -407,7 +408,7 @@ class AdminTargetView(discord.ui.View):
         self.add_item(AdminTargetSelect(mode, currency, action))
 
 
-class AdminPanelView(discord.ui.View):
+class LegacyAdminPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -455,3 +456,123 @@ class AdminPanelView(discord.ui.View):
             embed=history_embed("📖 BANK TRANSACTION LOG", rows),
             ephemeral=True,
         )
+
+
+class ReviewView(discord.ui.View):
+    def __init__(self, request_id:int):
+        super().__init__(timeout=None); self.request_id=request_id
+        a=discord.ui.Button(label="✅ 許可",style=discord.ButtonStyle.success,custom_id=f"review_ok:{request_id}")
+        r=discord.ui.Button(label="❌ 却下",style=discord.ButtonStyle.danger,custom_id=f"review_no:{request_id}")
+        a.callback=self.approve;r.callback=self.reject;self.add_item(a);self.add_item(r)
+    async def interaction_check(self,i):
+        if not i.user.guild_permissions.administrator:
+            await i.response.send_message("管理者専用です。",ephemeral=True);return False
+        return True
+    async def approve(self,i):
+        pool=get_pool()
+        async with pool.acquire() as c:
+          async with c.transaction():
+            q=await c.fetchrow("SELECT * FROM bank.transfer_requests WHERE request_id=$1 FOR UPDATE",self.request_id)
+            if not q or q["status"]!="PENDING":
+                await i.response.send_message("審査済みです。",ephemeral=True);return
+            fr=await c.fetchval("SELECT account_id FROM bank.accounts WHERE account_type='USER' AND owner_id=$1 AND currency='PAL'",q["requester_id"])
+            to=await c.fetchval("SELECT account_id FROM bank.accounts WHERE account_type='USER' AND owner_id=$1 AND currency='PAL'",q["recipient_id"])
+            ok=await c.fetchval("UPDATE bank.accounts SET balance=balance-$1,updated_at=now() WHERE account_id=$2 AND balance >= $1 RETURNING account_id",q["amount"],fr)
+            if not ok:
+                await c.execute("UPDATE bank.transfer_requests SET status='FAILED',reviewed_by=$1,reviewed_at=now() WHERE request_id=$2",str(i.user.id),self.request_id)
+                await i.response.edit_message(content="残高不足で処理終了",embed=None,view=None);return
+            await c.execute("UPDATE bank.accounts SET balance=balance+$1,updated_at=now() WHERE account_id=$2",q["amount"],to)
+            await c.execute("""INSERT INTO bank.transactions(idempotency_key,transaction_type,currency,from_account_id,to_account_id,amount,external_bot,external_reference_id,status,completed_at) VALUES($1,'USER_TRANSFER_APPROVED','PAL',$2,$3,$4,'PAL_BANK',$5,'COMPLETED',now())""",f"REVIEW:{self.request_id}",fr,to,q["amount"],str(self.request_id))
+            await c.execute("UPDATE bank.transfer_requests SET status='APPROVED',reviewed_by=$1,reviewed_at=now() WHERE request_id=$2",str(i.user.id),self.request_id)
+        await i.response.edit_message(content=f"✅ 許可済み｜審査者 {i.user.mention}",view=None)
+    async def reject(self,i):
+        pool=get_pool()
+        async with pool.acquire() as c:
+            result=await c.execute("UPDATE bank.transfer_requests SET status='REJECTED',reviewed_by=$1,reviewed_at=now() WHERE request_id=$2 AND status='PENDING'",str(i.user.id),self.request_id)
+        if result.endswith("0"): await i.response.send_message("審査済みです。",ephemeral=True);return
+        await i.response.edit_message(content=f"❌ 却下済み｜審査者 {i.user.mention}",embed=None,view=None)
+
+class RequestAmountModal(discord.ui.Modal,title="💸 PAL送金申請"):
+    amount=discord.ui.TextInput(label="送金額",placeholder="例: 10000",max_length=18)
+    def __init__(self,target):super().__init__();self.target=target
+    async def on_submit(self,i):
+        try:
+            amount=int(str(self.amount).replace(",",""));assert amount>0
+        except: await i.response.send_message("1以上の数字を入力してください。",ephemeral=True);return
+        b=await get_user_balances(str(i.user.id))
+        if b["PAL"]<amount: await i.response.send_message("PAL残高が足りません。",ephemeral=True);return
+        ch=await get_setting("transfer_review_channel_id")
+        if not ch: await i.response.send_message("送金審査チャンネルが未設定です。",ephemeral=True);return
+        pool=get_pool()
+        async with pool.acquire() as c:
+            rid=await c.fetchval("INSERT INTO bank.transfer_requests(requester_id,recipient_id,amount,status) VALUES($1,$2,$3,'PENDING') RETURNING request_id",str(i.user.id),str(self.target.id),amount)
+        channel=i.client.get_channel(int(ch)) or await i.client.fetch_channel(int(ch))
+        e=bank_embed(f"💸 PAL送金審査｜#{rid:06d}",color=PAL_GOLD)
+        e.description=f"申請者: {i.user.mention}\n送金先: {self.target.mention}\n金額: **{amount:,} PAL**\n申請時残高: {b['PAL']:,} PAL"
+        m=await channel.send(embed=e,view=ReviewView(rid))
+        async with pool.acquire() as c: await c.execute("UPDATE bank.transfer_requests SET review_channel_id=$1,review_message_id=$2 WHERE request_id=$3",str(channel.id),str(m.id),rid)
+        await i.response.send_message(f"送金申請 `#{rid:06d}` を運営へ送りました。",ephemeral=True)
+
+class RequestUserSelect(discord.ui.UserSelect):
+    def __init__(self):super().__init__(placeholder="送金相手を選択",min_values=1,max_values=1)
+    async def callback(self,i):
+        if self.values[0].bot: await i.response.send_message("Botは選択できません。",ephemeral=True);return
+        await i.response.send_modal(RequestAmountModal(self.values[0]))
+class RequestUserView(discord.ui.View):
+    def __init__(self):super().__init__(timeout=120);self.add_item(RequestUserSelect())
+
+class ExchangeModal2(discord.ui.Modal):
+    amount=discord.ui.TextInput(label="交換額",placeholder="数字のみ",max_length=18)
+    def __init__(self,d):self.d=d;super().__init__(title="PAL→CHIP" if d=="P2C" else "CHIP→PAL")
+    async def on_submit(self,i):
+        try:
+            a=int(str(self.amount).replace(",",""));x,xc,y,yc=await exchange(str(i.user.id),self.d,a)
+            await i.response.send_message(f"✅ **{x:,} {xc} → {y:,} {yc}**",ephemeral=True)
+        except InsufficientBalanceError: await i.response.send_message("残高が足りません。",ephemeral=True)
+        except ValueError as e: await i.response.send_message(str(e),ephemeral=True)
+class ExchangeView2(discord.ui.View):
+    def __init__(self):super().__init__(timeout=120)
+    @discord.ui.button(label="PAL → CHIP",style=discord.ButtonStyle.primary)
+    async def a(self,i,b):await i.response.send_modal(ExchangeModal2("P2C"))
+    @discord.ui.button(label="CHIP → PAL",style=discord.ButtonStyle.secondary)
+    async def b(self,i,b):await i.response.send_modal(ExchangeModal2("C2P"))
+
+class SettingsModal(discord.ui.Modal,title="🔄 交換設定"):
+    rate=discord.ui.TextInput(label="1 CHIP = 何PAL",placeholder="100")
+    fee=discord.ui.TextInput(label="手数料%",placeholder="0")
+    minimum=discord.ui.TextInput(label="最低交換PAL",placeholder="1000")
+    async def on_submit(self,i):
+        try:r=int(str(self.rate));f=int(str(self.fee));m=int(str(self.minimum));assert r>0 and 0<=f<=100 and m>0
+        except:await i.response.send_message("数字を正しく入力してください。",ephemeral=True);return
+        await set_setting("chip_rate_pal",str(r));await set_setting("exchange_fee_percent",str(f));await set_setting("exchange_min_pal",str(m))
+        await i.response.send_message(f"✅ 1 CHIP={r:,} PAL / 手数料{f}% / 最低{m:,} PAL",ephemeral=True)
+
+class BankPanelView(discord.ui.View):
+    def __init__(self):super().__init__(timeout=None)
+    @discord.ui.button(label="💰 残高確認",style=discord.ButtonStyle.primary,custom_id="final_balance",row=0)
+    async def bal(self,i,b):
+        x=await get_user_balances(str(i.user.id));e=bank_embed("🏦 PAL BANK｜MY ACCOUNT");e.add_field(name="💰 PAL",value=f"**{x['PAL']:,} PAL**");e.add_field(name="🎰 CHIP",value=f"**{x['CHIP']:,} CHIP**");await i.response.send_message(embed=e,ephemeral=True)
+    @discord.ui.button(label="💸 送金申請",style=discord.ButtonStyle.secondary,custom_id="final_transfer",row=0)
+    async def send(self,i,b):await i.response.send_message("送金相手を選択",view=RequestUserView(),ephemeral=True)
+    @discord.ui.button(label="🧧 ポチ袋作成",style=discord.ButtonStyle.secondary,custom_id="final_envelope",row=0)
+    async def env(self,i,b):await i.response.send_modal(EnvelopeModal())
+    @discord.ui.button(label="🔄 通貨交換",style=discord.ButtonStyle.primary,custom_id="final_exchange",row=1)
+    async def ex(self,i,b):
+        r=await get_setting("chip_rate_pal","100");f=await get_setting("exchange_fee_percent","0");m=await get_setting("exchange_min_pal","1000")
+        await i.response.send_message(f"**1 CHIP = {int(r):,} PAL｜手数料 {f}%｜最低 {int(m):,} PAL**",view=ExchangeView2(),ephemeral=True)
+    @discord.ui.button(label="📖 取引履歴",style=discord.ButtonStyle.secondary,custom_id="final_history",row=1)
+    async def hist(self,i,b):
+        uid=str(i.user.id);rows=await get_history(uid,100);await i.response.send_message(embed=history_embed("📖 TRANSACTION HISTORY",rows,uid),ephemeral=True)
+
+class AdminPanelView(LegacyAdminPanelView):
+    def __init__(self):
+        super().__init__()
+        self.add_item(discord.ui.Button(label="総通貨量",style=discord.ButtonStyle.primary,custom_id="final_totals",row=3))
+        self.add_item(discord.ui.Button(label="交換設定",style=discord.ButtonStyle.primary,custom_id="final_settings",row=3))
+        self.add_item(discord.ui.Button(label="このchを送金審査chに設定",style=discord.ButtonStyle.secondary,custom_id="final_review_ch",row=4))
+        self.children[-3].callback=self.show_totals;self.children[-2].callback=self.settings;self.children[-1].callback=self.review_ch
+    async def show_totals(self,i):
+        x=await totals();await i.response.send_message(f"💰 **PAL総量 {x['PAL']:,} PAL**\n🎰 **CHIP総量 {x['CHIP']:,} CHIP**",ephemeral=True)
+    async def settings(self,i):await i.response.send_modal(SettingsModal())
+    async def review_ch(self,i):
+        await set_setting("transfer_review_channel_id",str(i.channel_id));await i.response.send_message("✅ このチャンネルを送金審査chに設定しました。",ephemeral=True)

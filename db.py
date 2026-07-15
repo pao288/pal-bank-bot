@@ -134,6 +134,42 @@ async def _create_schema(conn: asyncpg.Connection) -> None:
     """)
 
 
+    await conn.execute("""
+    CREATE TABLE IF NOT EXISTS bank.transfer_requests (
+        request_id BIGSERIAL PRIMARY KEY,
+        requester_id TEXT NOT NULL,
+        recipient_id TEXT NOT NULL,
+        amount BIGINT NOT NULL CHECK (amount > 0),
+        status TEXT NOT NULL CHECK (status IN ('PENDING','APPROVED','REJECTED','FAILED')),
+        reviewed_by TEXT,
+        review_channel_id TEXT,
+        review_message_id TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        reviewed_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS bank.integration_events (
+        event_id BIGSERIAL PRIMARY KEY,
+        source_bot TEXT NOT NULL,
+        external_reference_id TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        currency TEXT NOT NULL CHECK (currency IN ('PAL','CHIP')),
+        amount BIGINT NOT NULL CHECK (amount > 0),
+        status TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        completed_at TIMESTAMPTZ,
+        UNIQUE(source_bot, external_reference_id)
+    );
+
+    INSERT INTO bank.settings(setting_key, setting_value) VALUES
+      ('chip_rate_pal','100'),
+      ('exchange_fee_percent','0'),
+      ('exchange_min_pal','1000')
+    ON CONFLICT(setting_key) DO NOTHING;
+    """)
+
+
 async def get_setting(key: str, default: str | None = None) -> str | None:
     pool = get_pool()
     async with pool.acquire() as conn:

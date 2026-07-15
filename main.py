@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 
@@ -5,7 +6,8 @@ import discord
 from discord.ext import commands
 
 from db import get_pool, get_setting, init_db_pool, set_setting
-from views import AdminPanelView, BankPanelView, EnvelopeClaimView
+from bank_services import rankings
+from views import AdminPanelView, BankPanelView, EnvelopeClaimView, ReviewView
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pal_bank")
@@ -26,6 +28,7 @@ def user_panel_embed() -> discord.Embed:
             "💰 **残高確認**　現在のPAL / CHIPを表示\n"
             "💸 **送金**　ユーザーへPALを送金\n"
             "🧧 **ポチ袋作成**　PALをランダム配布\n"
+            "🔄 **通貨交換**　PAL / CHIP交換\n"
             "📖 **取引履歴**　最新の入出金を確認\n\n"
             "操作したい機能を下のボタンから選択してください。"
         ),
@@ -90,6 +93,36 @@ async def ensure_fixed_panel(channel_id: int, kind: str):
     await set_setting(key, str(message.id))
 
 
+async def restore_review_views():
+    pool=get_pool()
+    async with pool.acquire() as c:
+        rows=await c.fetch("SELECT request_id FROM bank.transfer_requests WHERE status='PENDING'")
+    for r in rows: bot.add_view(ReviewView(r["request_id"]))
+
+def rank_embed(title,rows,suffix):
+    e=discord.Embed(title=title,color=0xFEE75C);medals=["🥇","🥈","🥉"];lines=[]
+    for n,r in enumerate(rows,1):
+        mark=medals[n-1] if n<=3 else f"`#{n}`";lines.append(f"{mark} <@{r['owner_id']}> — **{r['balance']:,} {suffix}**")
+    e.description="\n".join(lines) if lines else "データなし";e.set_footer(text="PAL BANK • 1時間ごとに自動更新");return e
+
+async def update_ranking():
+    cid=await get_setting("ranking_channel_id")
+    if not cid:return
+    ch=bot.get_channel(int(cid)) or await bot.fetch_channel(int(cid));pal,chip,total=await rankings()
+    embeds=[rank_embed("💰 PAL RANKING",pal,"PAL"),rank_embed("🎰 CHIP RANKING",chip,"CHIP"),rank_embed("🏆 TOTAL ASSET RANKING",total,"PAL換算")]
+    mid=await get_setting("ranking_message_id")
+    if mid:
+        try:msg=await ch.fetch_message(int(mid));await msg.edit(embeds=embeds);return
+        except:pass
+    msg=await ch.send(embeds=embeds);await set_setting("ranking_message_id",str(msg.id))
+
+async def ranking_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:await update_ranking()
+        except Exception:logger.exception("ranking update failed")
+        await asyncio.sleep(3600)
+
 async def setup_fixed_panels():
     user_channel = os.getenv("BANK_PANEL_CHANNEL_ID")
     admin_channel = os.getenv("BANK_ADMIN_CHANNEL_ID")
@@ -110,7 +143,9 @@ async def on_ready():
     bot.add_view(BankPanelView())
     bot.add_view(AdminPanelView())
     await restore_envelope_views()
+    await restore_review_views()
     await setup_fixed_panels()
+    bot.loop.create_task(ranking_loop())
 
     _ready_once = True
     logger.info("PAL BANK BOT起動完了: %s", bot.user)
@@ -129,6 +164,16 @@ async def bankpanel(ctx: commands.Context):
 async def adminpanel(ctx: commands.Context):
     message = await ctx.send(embed=admin_panel_embed(), view=AdminPanelView())
     await set_setting("admin_panel_message_id", str(message.id))
+
+
+
+@bot.command(name="rankingpanel")
+@commands.has_permissions(administrator=True)
+async def rankingpanel(ctx: commands.Context):
+    await set_setting("ranking_channel_id",str(ctx.channel.id))
+    await set_setting("ranking_message_id","0")
+    await update_ranking()
+    await ctx.send("✅ ランキングパネル設置完了",delete_after=5)
 
 
 @bot.event
