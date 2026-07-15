@@ -205,32 +205,44 @@ class EnvelopeChannelSelect(discord.ui.ChannelSelect):
         self.draft = draft
 
     async def callback(self, interaction: discord.Interaction):
-        if str(interaction.user.id) != self.draft.creator_id:
-            await interaction.response.send_message("作成者専用です。", ephemeral=True)
-            return
-
-        target_channel = self.values[0]
-        creator_id = self.draft.creator_id
-        total = self.draft.total
-        claims = self.draft.claims
-
-        if self.draft.distribution == "RANDOM":
-            cuts = sorted(random.sample(range(1, total), claims - 1)) if claims > 1 else []
-            points = [0] + cuts + [total]
-            slots = [points[i + 1] - points[i] for i in range(claims)]
-            random.shuffle(slots)
-            distribution_text = "🎲 ランダム配布"
-        else:
-            base, remainder = divmod(total, claims)
-            slots = [base + (1 if i < remainder else 0) for i in range(claims)]
-            random.shuffle(slots)
-            distribution_text = "⚖️ 均等配布"
-
-        source_id = await get_user_account_id(creator_id, "PAL")
-        pool = get_pool()
-        key = f"ENVELOPE_CREATE:{interaction.id}:{uuid.uuid4()}"
-
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
+            if str(interaction.user.id) != self.draft.creator_id:
+                await interaction.edit_original_response(content="作成者専用です。", embed=None, view=None)
+                return
+
+            selected_channel = self.values[0]
+            creator_id = self.draft.creator_id
+            total = self.draft.total
+            claims = self.draft.claims
+
+            target_channel = interaction.guild.get_channel(selected_channel.id)
+            if target_channel is None:
+                target_channel = await interaction.guild.fetch_channel(selected_channel.id)
+            if not isinstance(target_channel, discord.TextChannel):
+                await interaction.edit_original_response(content="テキストチャンネルを選択してください。", embed=None, view=None)
+                return
+
+            await ensure_user_accounts(creator_id)
+            source_id = await get_user_account_id(creator_id, "PAL")
+            if source_id is None:
+                raise RuntimeError("PAL口座を取得できませんでした。")
+
+            if self.draft.distribution == "RANDOM":
+                cuts = sorted(random.sample(range(1, total), claims - 1)) if claims > 1 else []
+                points = [0] + cuts + [total]
+                slots = [points[n + 1] - points[n] for n in range(claims)]
+                random.shuffle(slots)
+                distribution_text = "🎲 ランダム配布"
+            else:
+                base, remainder = divmod(total, claims)
+                slots = [base + (1 if n < remainder else 0) for n in range(claims)]
+                random.shuffle(slots)
+                distribution_text = "⚖️ 均等配布"
+
+            pool = get_pool()
+            key = f"ENVELOPE_CREATE:{interaction.id}:{uuid.uuid4()}"
+
             async with pool.acquire() as conn:
                 async with conn.transaction():
                     balance = await conn.fetchval(
@@ -241,107 +253,93 @@ class EnvelopeChannelSelect(discord.ui.ChannelSelect):
                         raise InsufficientBalanceError(key)
 
                     envelope_id = await conn.fetchval(
-                        """
-                        INSERT INTO bank.pal_envelopes
-                        (creator_id,total_amount,max_claims,status,source_channel_id)
-                        VALUES ($1,$2,$3,'ACTIVE',$4)
-                        RETURNING envelope_id
-                        """,
-                        creator_id, total, claims, str(target_channel.id),
+                        """INSERT INTO bank.pal_envelopes
+                           (creator_id,total_amount,max_claims,status,source_channel_id)
+                           VALUES($1,$2,$3,'ACTIVE',$4)
+                           RETURNING envelope_id""",
+                        creator_id,total,claims,str(target_channel.id),
                     )
                     await conn.execute(
                         "UPDATE bank.accounts SET balance=balance-$1,updated_at=now() WHERE account_id=$2",
-                        total, source_id,
+                        total,source_id,
                     )
                     await conn.execute(
-                        """
-                        INSERT INTO bank.transactions (
-                            idempotency_key,transaction_type,currency,
-                            from_account_id,to_account_id,amount,
-                            external_bot,external_reference_id,status,metadata,completed_at
-                        )
-                        VALUES ($1,'PAL_ENVELOPE_CREATE','PAL',$2,NULL,$3,
-                                'PAL_BANK',$4,'COMPLETED',
-                                jsonb_build_object(
-                                    'envelope_id',$5::bigint,
-                                    'distribution',$6::text,
-                                    'target_channel_id',$7::text
-                                ),now())
-                        """,
-                        key, source_id, total, str(envelope_id), envelope_id,
-                        self.draft.distribution, str(target_channel.id),
+                        """INSERT INTO bank.transactions(
+                             idempotency_key,transaction_type,currency,
+                             from_account_id,to_account_id,amount,
+                             external_bot,external_reference_id,status,metadata,completed_at
+                           ) VALUES(
+                             $1,'PAL_ENVELOPE_CREATE','PAL',$2,NULL,$3,
+                             'PAL_BANK',$4,'COMPLETED',
+                             jsonb_build_object(
+                               'envelope_id',$5::bigint,
+                               'distribution',$6::text,
+                               'target_channel_id',$7::text
+                             ),now()
+                           )""",
+                        key,source_id,total,str(envelope_id),envelope_id,
+                        self.draft.distribution,str(target_channel.id),
                     )
                     await conn.executemany(
-                        """
-                        INSERT INTO bank.pal_envelope_slots(envelope_id,amount,slot_order)
-                        VALUES ($1,$2,$3)
-                        """,
-                        [(envelope_id, value, i + 1) for i, value in enumerate(slots)],
+                        """INSERT INTO bank.pal_envelope_slots(envelope_id,amount,slot_order)
+                           VALUES($1,$2,$3)""",
+                        [(envelope_id,value,n+1) for n,value in enumerate(slots)],
                     )
+
+            embed = bank_embed("🧧 PAL ENVELOPE", color=PAL_GOLD)
+            embed.description = (
+                f"<@{creator_id}> からPALポチ袋！\n\n"
+                f"💰 **合計 {total:,} PAL**\n"
+                f"👥 **{claims}人限定**\n"
+                f"🎁 **{distribution_text}**\n\n"
+                "下のボタンから受け取ってください。"
+            )
+
+            try:
+                message = await target_channel.send(
+                    embed=embed,
+                    view=EnvelopeClaimView(envelope_id),
+                )
+            except Exception:
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            "UPDATE bank.accounts SET balance=balance+$1,updated_at=now() WHERE account_id=$2",
+                            total,source_id,
+                        )
+                        await conn.execute(
+                            "UPDATE bank.pal_envelopes SET status='CANCELLED' WHERE envelope_id=$1",
+                            envelope_id,
+                        )
+                        await conn.execute(
+                            "UPDATE bank.transactions SET status='REFUNDED' WHERE idempotency_key=$1",
+                            key,
+                        )
+                raise
+
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE bank.pal_envelopes SET source_message_id=$1 WHERE envelope_id=$2",
+                    str(message.id),envelope_id,
+                )
+
+            await interaction.edit_original_response(
+                content=f"✅ {target_channel.mention} にポチ袋を送信しました。",
+                embed=None,
+                view=None,
+            )
         except InsufficientBalanceError:
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content="PAL残高が足りません。",
                 embed=None,
                 view=None,
             )
-            return
-
-        embed = bank_embed("🧧 PAL ENVELOPE", color=PAL_GOLD)
-        embed.description = (
-            f"<@{creator_id}> からPALポチ袋！\n\n"
-            f"💰 **合計 {total:,} PAL**\n"
-            f"👥 **{claims}人限定**\n"
-            f"🎁 **{distribution_text}**\n\n"
-            "下のボタンから受け取ってください。"
-        )
-
-        try:
-            message = await target_channel.send(
-                embed=embed,
-                view=EnvelopeClaimView(envelope_id),
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            # Return reserved PAL if posting failed.
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute(
-                        "UPDATE bank.accounts SET balance=balance+$1,updated_at=now() WHERE account_id=$2",
-                        total, source_id,
-                    )
-                    await conn.execute(
-                        "UPDATE bank.pal_envelopes SET status='CANCELLED' WHERE envelope_id=$1",
-                        envelope_id,
-                    )
-                    await conn.execute(
-                        """
-                        UPDATE bank.transactions
-                        SET status='REFUNDED'
-                        WHERE idempotency_key=$1
-                        """,
-                        key,
-                    )
-            await interaction.response.edit_message(
-                content="そのテキストチャンネルへ投稿できませんでした。別のチャンネルを選んで作成してください。",
+        except Exception as exc:
+            await interaction.edit_original_response(
+                content=f"ポチ袋エラー: `{type(exc).__name__}`\n`{str(exc)[:900]}`",
                 embed=None,
                 view=None,
             )
-            return
-
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE bank.pal_envelopes
-                SET source_message_id=$1
-                WHERE envelope_id=$2
-                """,
-                str(message.id), envelope_id,
-            )
-
-        await interaction.response.edit_message(
-            content=f"✅ {target_channel.mention} にポチ袋を送信しました。",
-            embed=None,
-            view=None,
-        )
 
 
 class EnvelopeChannelView(discord.ui.View):
@@ -658,37 +656,101 @@ class ReviewView(discord.ui.View):
 
 class RequestAmountModal(discord.ui.Modal,title="💸 PAL送金申請"):
     amount=discord.ui.TextInput(label="送金額",placeholder="例: 10000",max_length=18)
-    def __init__(self,target):super().__init__();self.target=target
+
+    def __init__(self,target):
+        super().__init__()
+        self.target=target
+
     async def on_submit(self,i):
+        await i.response.defer(ephemeral=True, thinking=True)
         try:
-            amount=int(str(self.amount).replace(",",""));assert amount>0
-        except: await i.response.send_message("1以上の数字を入力してください。",ephemeral=True);return
-        if await maintenance_enabled():
-            await i.response.send_message("BANKはメンテナンスモード中です。",ephemeral=True);return
-        p=await profile(str(i.user.id))
-        if p["available_pal"]<amount:
-            await i.response.send_message(f"利用可能PALが足りません。利用可能: {p['available_pal']:,} PAL",ephemeral=True);return
-        duplicate=await duplicate_pending(str(i.user.id),str(self.target.id),amount)
-        if duplicate:
-            await i.response.send_message(f"同じ内容の審査中申請があります。`#{duplicate['request_id']:06d}`",ephemeral=True);return
-        warning=await transfer_warning(str(i.user.id),amount)
-        ch=await get_setting("transfer_review_channel_id")
-        if not ch: await i.response.send_message("送金審査チャンネルが未設定です。",ephemeral=True);return
-        pool=get_pool()
-        async with pool.acquire() as c:
-            rid=await c.fetchval("INSERT INTO bank.transfer_requests(requester_id,recipient_id,amount,status,warning_text) VALUES($1,$2,$3,'PENDING',$4) RETURNING request_id",str(i.user.id),str(self.target.id),amount,warning)
-        channel=i.client.get_channel(int(ch)) or await i.client.fetch_channel(int(ch))
-        e=bank_embed(f"💸 PAL送金審査｜#{rid:06d}",color=PAL_GOLD)
-        e.description=f"申請者: {i.user.mention}\n送金先: {self.target.mention}\n金額: **{amount:,} PAL**\n利用可能残高: {p['available_pal']:,} PAL" + (f"\n\n⚠️ **警告**\n{warning}" if warning else "")
-        m=await channel.send(embed=e,view=ReviewView(rid))
-        async with pool.acquire() as c: await c.execute("UPDATE bank.transfer_requests SET review_channel_id=$1,review_message_id=$2 WHERE request_id=$3",str(channel.id),str(m.id),rid)
-        await i.response.send_message(f"送金申請 `#{rid:06d}` を運営へ送りました。",ephemeral=True)
+            amount=int(str(self.amount).replace(",","").strip())
+            if amount <= 0:
+                raise ValueError("1以上の数字を入力してください。")
+
+            if await maintenance_enabled():
+                await i.edit_original_response(content="BANKはメンテナンスモード中です。")
+                return
+
+            p=await profile(str(i.user.id))
+            if p["available_pal"] < amount:
+                await i.edit_original_response(
+                    content=f"利用可能PALが足りません。利用可能: {p['available_pal']:,} PAL"
+                )
+                return
+
+            duplicate=await duplicate_pending(str(i.user.id),str(self.target.id),amount)
+            if duplicate:
+                await i.edit_original_response(
+                    content=f"同じ内容の審査中申請があります。`#{duplicate['request_id']:06d}`"
+                )
+                return
+
+            warning=await transfer_warning(str(i.user.id),amount)
+            ch=await get_setting("transfer_review_channel_id","0")
+            if not ch or ch == "0":
+                await i.edit_original_response(
+                    content="送金審査チャンネルが未設定です。`!banksetup` からONにしてください。"
+                )
+                return
+
+            channel=i.guild.get_channel(int(ch))
+            if channel is None:
+                channel=await i.guild.fetch_channel(int(ch))
+
+            pool=get_pool()
+            async with pool.acquire() as conn:
+                rid=await conn.fetchval(
+                    """INSERT INTO bank.transfer_requests
+                       (requester_id,recipient_id,amount,status,warning_text)
+                       VALUES($1,$2,$3,'PENDING',$4)
+                       RETURNING request_id""",
+                    str(i.user.id),str(self.target.id),amount,warning,
+                )
+
+            e=bank_embed(f"💸 PAL送金審査｜#{rid:06d}",color=PAL_GOLD)
+            e.description=(
+                f"申請者: {i.user.mention}\n"
+                f"送金先: {self.target.mention}\n"
+                f"金額: **{amount:,} PAL**\n"
+                f"利用可能残高: {p['available_pal']:,} PAL"
+                + (f"\n\n⚠️ **警告**\n{warning}" if warning else "")
+            )
+            m=await channel.send(embed=e,view=ReviewView(rid))
+
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE bank.transfer_requests
+                       SET review_channel_id=$1,review_message_id=$2
+                       WHERE request_id=$3""",
+                    str(channel.id),str(m.id),rid,
+                )
+
+            await i.edit_original_response(
+                content=f"✅ 送金申請 `#{rid:06d}` を運営へ送りました。"
+            )
+        except ValueError as exc:
+            await i.edit_original_response(content=str(exc))
+        except Exception as exc:
+            await i.edit_original_response(
+                content=f"送金申請エラー: `{type(exc).__name__}`\n`{str(exc)[:900]}`"
+            )
+
 
 class RequestUserSelect(discord.ui.UserSelect):
-    def __init__(self):super().__init__(placeholder="送金相手を選択",min_values=1,max_values=1)
+    def __init__(self):
+        super().__init__(placeholder="送金相手を選択",min_values=1,max_values=1)
     async def callback(self,i):
-        if self.values[0].bot: await i.response.send_message("Botは選択できません。",ephemeral=True);return
-        await i.response.send_modal(RequestAmountModal(self.values[0]))
+        try:
+            target=self.values[0]
+            if target.bot:
+                await i.response.send_message("Botは選択できません。",ephemeral=True);return
+            if target.id == i.user.id:
+                await i.response.send_message("自分自身は送金先に選択できません。",ephemeral=True);return
+            await i.response.send_modal(RequestAmountModal(target))
+        except Exception as exc:
+            if not i.response.is_done():
+                await i.response.send_message(f"送金先選択エラー: `{type(exc).__name__}`\n`{str(exc)[:700]}`",ephemeral=True)
 class RequestUserView(discord.ui.View):
     def __init__(self):super().__init__(timeout=120);self.add_item(RequestUserSelect())
 
