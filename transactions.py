@@ -117,7 +117,8 @@ async def get_history(user_id: str, limit: int = 100) -> list:
             FROM bank.transactions t
             LEFT JOIN bank.accounts fa ON fa.account_id=t.from_account_id
             LEFT JOIN bank.accounts ta ON ta.account_id=t.to_account_id
-            WHERE fa.owner_id=$1 OR ta.owner_id=$1
+            WHERE (fa.owner_id=$1 OR ta.owner_id=$1)
+              AND COALESCE((t.metadata->>'hidden')::boolean, false)=false
             ORDER BY t.bank_transaction_id DESC
             LIMIT $2
             """,

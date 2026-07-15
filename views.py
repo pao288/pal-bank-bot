@@ -1,5 +1,6 @@
 import random
 import uuid
+import io
 
 import discord
 
@@ -7,6 +8,12 @@ from accounts import ensure_user_accounts, get_user_account_id, get_user_balance
 from db import get_pool, get_setting, set_setting
 from transactions import InsufficientBalanceError, get_all_history, get_history, transfer
 from bank_services import exchange, totals
+from bank_advanced import (
+    add_notification, atomic_exchange, csv_export_bytes, duplicate_pending,
+    get_notifications, maintenance_enabled, profile, reverse_transaction,
+    search_transactions, set_maintenance, statistics, transfer_warning,
+)
+
 
 PAL_BLUE = 0x5865F2
 PAL_GREEN = 0x57F287
@@ -110,11 +117,22 @@ class TransferUserView(discord.ui.View):
         self.add_item(TransferUserSelect())
 
 
+class EnvelopeDraft:
+    def __init__(self, creator_id: str, total: int, claims: int):
+        self.creator_id = creator_id
+        self.total = total
+        self.claims = claims
+        self.distribution = None
+
+
 class EnvelopeModal(discord.ui.Modal, title="🧧 PALポチ袋作成"):
     total_amount = discord.ui.TextInput(label="合計PAL", placeholder="例: 10000", max_length=18)
     max_claims = discord.ui.TextInput(label="受取人数", placeholder="1〜100", max_length=3)
 
     async def on_submit(self, interaction: discord.Interaction):
+        if await maintenance_enabled():
+            await interaction.response.send_message("BANKはメンテナンスモード中です。", ephemeral=True)
+            return
         try:
             total = int(str(self.total_amount).replace(",", "").strip())
             claims = int(str(self.max_claims).strip())
@@ -127,13 +145,88 @@ class EnvelopeModal(discord.ui.Modal, title="🧧 PALポチ袋作成"):
             )
             return
 
-        creator_id = str(interaction.user.id)
-        source_id = await get_user_account_id(creator_id, "PAL")
-        cuts = sorted(random.sample(range(1, total), claims - 1)) if claims > 1 else []
-        points = [0] + cuts + [total]
-        slots = [points[i + 1] - points[i] for i in range(claims)]
-        random.shuffle(slots)
+        balances = await get_user_balances(str(interaction.user.id))
+        if balances["PAL"] < total:
+            await interaction.response.send_message("PAL残高が足りません。", ephemeral=True)
+            return
 
+        draft = EnvelopeDraft(str(interaction.user.id), total, claims)
+        embed = bank_embed("🧧 配布方式を選択", color=PAL_GOLD)
+        embed.description = (
+            f"💰 合計 **{total:,} PAL**\n"
+            f"👥 **{claims}人**\n\n"
+            "🎲 **ランダム**：受取額をランダム配分\n"
+            "⚖️ **均等**：全員へ均等配分"
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=EnvelopeDistributionView(draft),
+            ephemeral=True,
+        )
+
+
+class EnvelopeDistributionView(discord.ui.View):
+    def __init__(self, draft: EnvelopeDraft):
+        super().__init__(timeout=180)
+        self.draft = draft
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.draft.creator_id:
+            await interaction.response.send_message("作成者専用です。", ephemeral=True)
+            return False
+        return True
+
+    async def show_channel_select(self, interaction: discord.Interaction, distribution: str):
+        self.draft.distribution = distribution
+        label = "🎲 ランダム" if distribution == "RANDOM" else "⚖️ 均等"
+        await interaction.response.edit_message(
+            content=f"{label}を選択しました。送信先のテキストチャンネルを選んでください。",
+            embed=None,
+            view=EnvelopeChannelView(self.draft),
+        )
+
+    @discord.ui.button(label="🎲 ランダム", style=discord.ButtonStyle.primary)
+    async def random_distribution(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_channel_select(interaction, "RANDOM")
+
+    @discord.ui.button(label="⚖️ 均等", style=discord.ButtonStyle.secondary)
+    async def equal_distribution(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_channel_select(interaction, "EQUAL")
+
+
+class EnvelopeChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, draft: EnvelopeDraft):
+        super().__init__(
+            placeholder="ポチ袋を送信するテキストチャンネルを選択",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+        )
+        self.draft = draft
+
+    async def callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.draft.creator_id:
+            await interaction.response.send_message("作成者専用です。", ephemeral=True)
+            return
+
+        target_channel = self.values[0]
+        creator_id = self.draft.creator_id
+        total = self.draft.total
+        claims = self.draft.claims
+
+        if self.draft.distribution == "RANDOM":
+            cuts = sorted(random.sample(range(1, total), claims - 1)) if claims > 1 else []
+            points = [0] + cuts + [total]
+            slots = [points[i + 1] - points[i] for i in range(claims)]
+            random.shuffle(slots)
+            distribution_text = "🎲 ランダム配布"
+        else:
+            base, remainder = divmod(total, claims)
+            slots = [base + (1 if i < remainder else 0) for i in range(claims)]
+            random.shuffle(slots)
+            distribution_text = "⚖️ 均等配布"
+
+        source_id = await get_user_account_id(creator_id, "PAL")
         pool = get_pool()
         key = f"ENVELOPE_CREATE:{interaction.id}:{uuid.uuid4()}"
 
@@ -154,7 +247,7 @@ class EnvelopeModal(discord.ui.Modal, title="🧧 PALポチ袋作成"):
                         VALUES ($1,$2,$3,'ACTIVE',$4)
                         RETURNING envelope_id
                         """,
-                        creator_id, total, claims, str(interaction.channel_id),
+                        creator_id, total, claims, str(target_channel.id),
                     )
                     await conn.execute(
                         "UPDATE bank.accounts SET balance=balance-$1,updated_at=now() WHERE account_id=$2",
@@ -169,9 +262,14 @@ class EnvelopeModal(discord.ui.Modal, title="🧧 PALポチ袋作成"):
                         )
                         VALUES ($1,'PAL_ENVELOPE_CREATE','PAL',$2,NULL,$3,
                                 'PAL_BANK',$4,'COMPLETED',
-                                jsonb_build_object('envelope_id',$5::bigint),now())
+                                jsonb_build_object(
+                                    'envelope_id',$5::bigint,
+                                    'distribution',$6::text,
+                                    'target_channel_id',$7::text
+                                ),now())
                         """,
                         key, source_id, total, str(envelope_id), envelope_id,
+                        self.draft.distribution, str(target_channel.id),
                     )
                     await conn.executemany(
                         """
@@ -181,23 +279,75 @@ class EnvelopeModal(discord.ui.Modal, title="🧧 PALポチ袋作成"):
                         [(envelope_id, value, i + 1) for i, value in enumerate(slots)],
                     )
         except InsufficientBalanceError:
-            await interaction.response.send_message("PAL残高が足りません。", ephemeral=True)
+            await interaction.response.edit_message(
+                content="PAL残高が足りません。",
+                embed=None,
+                view=None,
+            )
             return
 
         embed = bank_embed("🧧 PAL ENVELOPE", color=PAL_GOLD)
         embed.description = (
-            f"{interaction.user.mention} からPALポチ袋！\n\n"
+            f"<@{creator_id}> からPALポチ袋！\n\n"
             f"💰 **合計 {total:,} PAL**\n"
-            f"👥 **{claims}人限定**\n\n"
+            f"👥 **{claims}人限定**\n"
+            f"🎁 **{distribution_text}**\n\n"
             "下のボタンから受け取ってください。"
         )
-        await interaction.response.send_message("ポチ袋を作成しました。", ephemeral=True)
-        message = await interaction.channel.send(embed=embed, view=EnvelopeClaimView(envelope_id))
+
+        try:
+            message = await target_channel.send(
+                embed=embed,
+                view=EnvelopeClaimView(envelope_id),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            # Return reserved PAL if posting failed.
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        "UPDATE bank.accounts SET balance=balance+$1,updated_at=now() WHERE account_id=$2",
+                        total, source_id,
+                    )
+                    await conn.execute(
+                        "UPDATE bank.pal_envelopes SET status='CANCELLED' WHERE envelope_id=$1",
+                        envelope_id,
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE bank.transactions
+                        SET status='REFUNDED'
+                        WHERE idempotency_key=$1
+                        """,
+                        key,
+                    )
+            await interaction.response.edit_message(
+                content="そのテキストチャンネルへ投稿できませんでした。別のチャンネルを選んで作成してください。",
+                embed=None,
+                view=None,
+            )
+            return
+
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE bank.pal_envelopes SET source_message_id=$1 WHERE envelope_id=$2",
+                """
+                UPDATE bank.pal_envelopes
+                SET source_message_id=$1
+                WHERE envelope_id=$2
+                """,
                 str(message.id), envelope_id,
             )
+
+        await interaction.response.edit_message(
+            content=f"✅ {target_channel.mention} にポチ袋を送信しました。",
+            embed=None,
+            view=None,
+        )
+
+
+class EnvelopeChannelView(discord.ui.View):
+    def __init__(self, draft: EnvelopeDraft):
+        super().__init__(timeout=180)
+        self.add_item(EnvelopeChannelSelect(draft))
 
 
 class EnvelopeClaimView(discord.ui.View):
@@ -341,6 +491,7 @@ class LegacyBankPanelView(discord.ui.View):
 
 class AdminAmountModal(discord.ui.Modal):
     amount = discord.ui.TextInput(label="金額", placeholder="例: 10000", max_length=18)
+    reason = discord.ui.TextInput(label="理由", placeholder="例: イベント景品 / 補填 / SHOP返金", max_length=100)
 
     def __init__(self, target: discord.Member, currency: str, action: str):
         self.target = target
@@ -370,7 +521,7 @@ class AdminAmountModal(discord.ui.Modal):
                 amount,
                 external_bot="PAL_BANK_ADMIN",
                 external_reference_id=str(interaction.id),
-                metadata={"admin_id": str(interaction.user.id), "target_id": str(self.target.id)},
+                metadata={"admin_id": str(interaction.user.id), "target_id": str(self.target.id), "reason": str(self.reason), "public_tx_id": f"ADMIN-{interaction.id}"},
             )
         except InsufficientBalanceError:
             await interaction.response.send_message("対象ユーザーの残高が足りません。", ephemeral=True)
@@ -484,12 +635,18 @@ class ReviewView(discord.ui.View):
             await c.execute("UPDATE bank.accounts SET balance=balance+$1,updated_at=now() WHERE account_id=$2",q["amount"],to)
             await c.execute("""INSERT INTO bank.transactions(idempotency_key,transaction_type,currency,from_account_id,to_account_id,amount,external_bot,external_reference_id,status,completed_at) VALUES($1,'USER_TRANSFER_APPROVED','PAL',$2,$3,$4,'PAL_BANK',$5,'COMPLETED',now())""",f"REVIEW:{self.request_id}",fr,to,q["amount"],str(self.request_id))
             await c.execute("UPDATE bank.transfer_requests SET status='APPROVED',reviewed_by=$1,reviewed_at=now() WHERE request_id=$2",str(i.user.id),self.request_id)
+        await add_notification(q["requester_id"],"TRANSFER_APPROVED","送金が許可されました",f"{q['amount']:,} PAL の送金申請 #{self.request_id:06d} が許可されました。")
+        await add_notification(q["recipient_id"],"TRANSFER_RECEIVED","PALを受け取りました",f"{q['amount']:,} PAL を受け取りました。取引 #{self.request_id:06d}")
         await i.response.edit_message(content=f"✅ 許可済み｜審査者 {i.user.mention}",view=None)
     async def reject(self,i):
         pool=get_pool()
         async with pool.acquire() as c:
             result=await c.execute("UPDATE bank.transfer_requests SET status='REJECTED',reviewed_by=$1,reviewed_at=now() WHERE request_id=$2 AND status='PENDING'",str(i.user.id),self.request_id)
         if result.endswith("0"): await i.response.send_message("審査済みです。",ephemeral=True);return
+        pool=get_pool()
+        async with pool.acquire() as c:
+            q=await c.fetchrow("SELECT requester_id,amount FROM bank.transfer_requests WHERE request_id=$1",self.request_id)
+        if q: await add_notification(q["requester_id"],"TRANSFER_REJECTED","送金が却下されました",f"{q['amount']:,} PAL の送金申請 #{self.request_id:06d} が却下されました。審査中PALは利用可能に戻りました。")
         await i.response.edit_message(content=f"❌ 却下済み｜審査者 {i.user.mention}",embed=None,view=None)
 
 class RequestAmountModal(discord.ui.Modal,title="💸 PAL送金申請"):
@@ -499,16 +656,23 @@ class RequestAmountModal(discord.ui.Modal,title="💸 PAL送金申請"):
         try:
             amount=int(str(self.amount).replace(",",""));assert amount>0
         except: await i.response.send_message("1以上の数字を入力してください。",ephemeral=True);return
-        b=await get_user_balances(str(i.user.id))
-        if b["PAL"]<amount: await i.response.send_message("PAL残高が足りません。",ephemeral=True);return
+        if await maintenance_enabled():
+            await i.response.send_message("BANKはメンテナンスモード中です。",ephemeral=True);return
+        p=await profile(str(i.user.id))
+        if p["available_pal"]<amount:
+            await i.response.send_message(f"利用可能PALが足りません。利用可能: {p['available_pal']:,} PAL",ephemeral=True);return
+        duplicate=await duplicate_pending(str(i.user.id),str(self.target.id),amount)
+        if duplicate:
+            await i.response.send_message(f"同じ内容の審査中申請があります。`#{duplicate['request_id']:06d}`",ephemeral=True);return
+        warning=await transfer_warning(str(i.user.id),amount)
         ch=await get_setting("transfer_review_channel_id")
         if not ch: await i.response.send_message("送金審査チャンネルが未設定です。",ephemeral=True);return
         pool=get_pool()
         async with pool.acquire() as c:
-            rid=await c.fetchval("INSERT INTO bank.transfer_requests(requester_id,recipient_id,amount,status) VALUES($1,$2,$3,'PENDING') RETURNING request_id",str(i.user.id),str(self.target.id),amount)
+            rid=await c.fetchval("INSERT INTO bank.transfer_requests(requester_id,recipient_id,amount,status,warning_text) VALUES($1,$2,$3,'PENDING',$4) RETURNING request_id",str(i.user.id),str(self.target.id),amount,warning)
         channel=i.client.get_channel(int(ch)) or await i.client.fetch_channel(int(ch))
         e=bank_embed(f"💸 PAL送金審査｜#{rid:06d}",color=PAL_GOLD)
-        e.description=f"申請者: {i.user.mention}\n送金先: {self.target.mention}\n金額: **{amount:,} PAL**\n申請時残高: {b['PAL']:,} PAL"
+        e.description=f"申請者: {i.user.mention}\n送金先: {self.target.mention}\n金額: **{amount:,} PAL**\n利用可能残高: {p['available_pal']:,} PAL" + (f"\n\n⚠️ **警告**\n{warning}" if warning else "")
         m=await channel.send(embed=e,view=ReviewView(rid))
         async with pool.acquire() as c: await c.execute("UPDATE bank.transfer_requests SET review_channel_id=$1,review_message_id=$2 WHERE request_id=$3",str(channel.id),str(m.id),rid)
         await i.response.send_message(f"送金申請 `#{rid:06d}` を運営へ送りました。",ephemeral=True)
@@ -526,8 +690,8 @@ class ExchangeModal2(discord.ui.Modal):
     def __init__(self,d):self.d=d;super().__init__(title="PAL→CHIP" if d=="P2C" else "CHIP→PAL")
     async def on_submit(self,i):
         try:
-            a=int(str(self.amount).replace(",",""));x,xc,y,yc=await exchange(str(i.user.id),self.d,a)
-            await i.response.send_message(f"✅ **{x:,} {xc} → {y:,} {yc}**",ephemeral=True)
+            a=int(str(self.amount).replace(",",""));x,xc,y,yc,txid=await atomic_exchange(str(i.user.id),self.d,a)
+            await i.response.send_message(f"✅ **{x:,} {xc} → {y:,} {yc}**\n取引ID: `{txid}`",ephemeral=True)
         except InsufficientBalanceError: await i.response.send_message("残高が足りません。",ephemeral=True)
         except ValueError as e: await i.response.send_message(str(e),ephemeral=True)
 class ExchangeView2(discord.ui.View):
@@ -576,3 +740,125 @@ class AdminPanelView(LegacyAdminPanelView):
     async def settings(self,i):await i.response.send_modal(SettingsModal())
     async def review_ch(self,i):
         await set_setting("transfer_review_channel_id",str(i.channel_id));await i.response.send_message("✅ このチャンネルを送金審査chに設定しました。",ephemeral=True)
+
+
+class TransactionSearchModal(discord.ui.Modal, title="🔎 取引検索"):
+    user_id = discord.ui.TextInput(label="ユーザーID（空欄可）", required=False, max_length=25)
+    currency = discord.ui.TextInput(label="通貨 PAL / CHIP（空欄可）", required=False, max_length=4)
+    source = discord.ui.TextInput(label="種類 SHOP / CASINO / VOICE / ADMIN 等", required=False, max_length=30)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid = str(self.user_id).strip() or None
+        cur = str(self.currency).strip().upper() or None
+        src = str(self.source).strip().upper() or None
+        rows = await search_transactions(uid, cur, src, 25)
+        lines = []
+        for r in rows:
+            meta = r["metadata"] or {}
+            txid = meta.get("public_tx_id") or f"DB-{r['bank_transaction_id']}"
+            reason = meta.get("reason") or "-"
+            lines.append(f"`{txid}` {r['transaction_type']}｜{r['amount']:,} {r['currency']}｜理由:{reason}")
+        e = bank_embed("🔎 TRANSACTION SEARCH", color=PAL_DARK)
+        e.description = "\n".join(lines[:25]) if lines else "該当取引なし"
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+class ReversalModal(discord.ui.Modal, title="↩️ 取引取消・返金"):
+    transaction_id = discord.ui.TextInput(label="DB取引ID", placeholder="例: 123", max_length=20)
+    reason = discord.ui.TextInput(label="取消・返金理由", placeholder="例: 誤付与の取消", max_length=100)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            txid = int(str(self.transaction_id).strip())
+            code = await reverse_transaction(txid, str(interaction.user.id), str(self.reason))
+            await interaction.response.send_message(f"✅ 逆取引を作成しました。取引ID: `{code}`", ephemeral=True)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+
+
+class BankPanelView(BankPanelView):
+    @discord.ui.button(label="👤 BANKプロフィール", style=discord.ButtonStyle.primary, custom_id="ultimate_profile", row=2)
+    async def bank_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = await profile(str(interaction.user.id))
+        e = bank_embed("💳 PAL BANK PROFILE", color=PAL_GOLD)
+        e.add_field(name="💰 PAL残高", value=f"**{p['PAL']:,} PAL**", inline=True)
+        e.add_field(name="🎰 CHIP残高", value=f"**{p['CHIP']:,} CHIP**", inline=True)
+        e.add_field(name="🔓 利用可能PAL", value=f"**{p['available_pal']:,} PAL**", inline=True)
+        e.add_field(name="⏳ 審査中PAL", value=f"**{p['pending_pal']:,} PAL**", inline=True)
+        e.add_field(name="🏆 総資産", value=f"**{p['asset_pal']:,} PAL換算**", inline=True)
+        e.add_field(name="📊 資産順位", value=f"**#{p['rank']}**", inline=True)
+        e.add_field(name="🔔 未読通知", value=f"**{p['unread']}件**", inline=True)
+        if p["created_at"]:
+            e.set_footer(text=f"口座開設: {p['created_at']:%Y-%m-%d} • 1 CHIP = {p['rate']:,} PAL")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="🔔 通知", style=discord.ButtonStyle.secondary, custom_id="ultimate_notifications", row=2)
+    async def notifications(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rows = await get_notifications(str(interaction.user.id), 10)
+        e = bank_embed("🔔 BANK NOTIFICATIONS", color=PAL_DARK)
+        e.description = "\n\n".join(
+            f"{'🔵' if not r['is_read'] else '⚪'} **{r['title']}**\n{r['body']}"
+            for r in rows
+        ) if rows else "通知はありません。"
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+class AdminPanelView(AdminPanelView):
+    def __init__(self):
+        super().__init__()
+        items = [
+            ("通貨統計", discord.ButtonStyle.primary, "ultimate_stats", 3, self.show_stats),
+            ("取引検索", discord.ButtonStyle.secondary, "ultimate_search", 3, self.search),
+            ("取消・返金", discord.ButtonStyle.danger, "ultimate_reversal", 3, self.reversal),
+            ("メンテON/OFF", discord.ButtonStyle.danger, "ultimate_maintenance", 4, self.maintenance),
+            ("このchを移動ログchに設定", discord.ButtonStyle.secondary, "ultimate_log_ch", 4, self.log_channel),
+            ("このchをBANK状態chに設定", discord.ButtonStyle.secondary, "ultimate_status_ch", 4, self.status_channel),
+            ("CSV出力", discord.ButtonStyle.secondary, "ultimate_csv", 4, self.csv_export),
+        ]
+        for label, style, cid, row, callback in items:
+            b = discord.ui.Button(label=label, style=style, custom_id=cid, row=row)
+            b.callback = callback
+            self.add_item(b)
+
+    async def show_stats(self, interaction):
+        s = await statistics()
+        e = bank_embed("📈 PAL BANK STATISTICS", color=PAL_DARK)
+        e.add_field(name="口座ユーザー", value=f"{s['users']:,}人")
+        e.add_field(name="完了取引", value=f"{s['completed']:,}件")
+        e.add_field(name="24時間取引", value=f"{s['tx24']:,}件")
+        e.add_field(name="PAL移動総量", value=f"{s['moved_pal']:,} PAL")
+        e.add_field(name="CHIP移動総量", value=f"{s['moved_chip']:,} CHIP")
+        e.add_field(name="送金審査中", value=f"{s['req_pending']:,}件")
+        e.add_field(name="送金許可", value=f"{s['req_approved']:,}件")
+        e.add_field(name="送金却下", value=f"{s['req_rejected']:,}件")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    async def search(self, interaction):
+        await interaction.response.send_modal(TransactionSearchModal())
+
+    async def reversal(self, interaction):
+        await interaction.response.send_modal(ReversalModal())
+
+    async def maintenance(self, interaction):
+        now = await maintenance_enabled()
+        await set_maintenance(not now)
+        await interaction.response.send_message(
+            f"{'🔴 メンテナンスモード ON' if not now else '🟢 メンテナンスモード OFF'}",
+            ephemeral=True,
+        )
+
+    async def log_channel(self, interaction):
+        await set_setting("movement_log_channel_id", str(interaction.channel_id))
+        await interaction.response.send_message("✅ このチャンネルを通貨移動ログchに設定しました。", ephemeral=True)
+
+    async def status_channel(self, interaction):
+        await set_setting("bank_status_channel_id", str(interaction.channel_id))
+        await interaction.response.send_message("✅ このチャンネルをBANKステータスchに設定しました。", ephemeral=True)
+
+    async def csv_export(self, interaction):
+        data = await csv_export_bytes()
+        await interaction.response.send_message(
+            "直近最大5,000件の取引CSVです。",
+            file=discord.File(io.BytesIO(data), filename="pal_bank_transactions.csv"),
+            ephemeral=True,
+        )

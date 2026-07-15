@@ -7,6 +7,7 @@ from discord.ext import commands
 
 from db import get_pool, get_setting, init_db_pool, set_setting
 from bank_services import rankings
+from bank_advanced import maintenance_enabled, statistics
 from views import AdminPanelView, BankPanelView, EnvelopeClaimView, ReviewView
 
 logging.basicConfig(level=logging.INFO)
@@ -99,17 +100,24 @@ async def restore_review_views():
         rows=await c.fetch("SELECT request_id FROM bank.transfer_requests WHERE status='PENDING'")
     for r in rows: bot.add_view(ReviewView(r["request_id"]))
 
-def rank_embed(title,rows,suffix):
-    e=discord.Embed(title=title,color=0xFEE75C);medals=["🥇","🥈","🥉"];lines=[]
+def rank_embed(title,rows,suffix,rate=None):
+    e=discord.Embed(title=title,color=0xFEE75C);medals={1:"🥇",2:"🥈",3:"🥉"};lines=[]
+    previous=None;rank=0
     for n,r in enumerate(rows,1):
-        mark=medals[n-1] if n<=3 else f"`#{n}`";lines.append(f"{mark} <@{r['owner_id']}> — **{r['balance']:,} {suffix}**")
-    e.description="\n".join(lines) if lines else "データなし";e.set_footer(text="PAL BANK • 1時間ごとに自動更新");return e
+        if previous is None or r["balance"] != previous: rank=n
+        previous=r["balance"];mark=medals.get(rank,f"`#{rank}`")
+        lines.append(f"{mark} <@{r['owner_id']}> — **{r['balance']:,} {suffix}**")
+    e.description="\n".join(lines) if lines else "データなし"
+    footer="PAL BANK • 1時間ごとに自動更新"
+    if rate is not None: footer += f" • 1 CHIP = {rate:,} PAL換算"
+    e.set_footer(text=footer);return e
 
 async def update_ranking():
     cid=await get_setting("ranking_channel_id")
     if not cid:return
     ch=bot.get_channel(int(cid)) or await bot.fetch_channel(int(cid));pal,chip,total=await rankings()
-    embeds=[rank_embed("💰 PAL RANKING",pal,"PAL"),rank_embed("🎰 CHIP RANKING",chip,"CHIP"),rank_embed("🏆 TOTAL ASSET RANKING",total,"PAL換算")]
+    rate=int(await get_setting("chip_rate_pal","100"))
+    embeds=[rank_embed("💰 PAL RANKING",pal,"PAL"),rank_embed("🎰 CHIP RANKING",chip,"CHIP"),rank_embed("🏆 TOTAL ASSET RANKING",total,"PAL換算",rate)]
     mid=await get_setting("ranking_message_id")
     if mid:
         try:msg=await ch.fetch_message(int(mid));await msg.edit(embeds=embeds);return
@@ -122,6 +130,97 @@ async def ranking_loop():
         try:await update_ranking()
         except Exception:logger.exception("ranking update failed")
         await asyncio.sleep(3600)
+
+
+async def movement_log_loop():
+    await bot.wait_until_ready()
+    last_id = 0
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        last_id = await conn.fetchval(
+            "SELECT COALESCE(MAX(bank_transaction_id),0) FROM bank.transactions"
+        )
+    while not bot.is_closed():
+        try:
+            channel_id = await get_setting("movement_log_channel_id", "0")
+            if channel_id and channel_id != "0":
+                channel = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """SELECT t.*,fa.owner_id from_user,ta.owner_id to_user
+                           FROM bank.transactions t
+                           LEFT JOIN bank.accounts fa ON fa.account_id=t.from_account_id
+                           LEFT JOIN bank.accounts ta ON ta.account_id=t.to_account_id
+                           WHERE t.bank_transaction_id>$1 AND t.status='COMPLETED'
+                           ORDER BY t.bank_transaction_id ASC LIMIT 100""",
+                        last_id,
+                    )
+                for r in rows:
+                    meta = r["metadata"] or {}
+                    txid = meta.get("public_tx_id") or f"DB-{r['bank_transaction_id']}"
+                    source = (r["external_bot"] or r["transaction_type"] or "BANK").upper()
+                    if "SHOP" in source: icon, label = "🛒", "SHOP"
+                    elif "CASINO" in source: icon, label = "🎰", "CASINO"
+                    elif "VOICE" in source: icon, label = "🎙️", "VOICE"
+                    elif "ADMIN" in source: icon, label = "🛠️", "ADMIN"
+                    elif "TRANSFER" in r["transaction_type"]: icon, label = "💸", "SEND"
+                    else: icon, label = "🏦", "BANK"
+                    e = discord.Embed(title=f"{icon} {label}｜通貨移動", color=0x2B2D31)
+                    e.description = (
+                        f"取引ID: `{txid}`\n"
+                        f"種類: `{r['transaction_type']}`\n"
+                        f"通貨: **{r['amount']:,} {r['currency']}**\n"
+                        f"FROM: {f'<@{r['from_user']}>' if r['from_user'] else 'SYSTEM'}\n"
+                        f"TO: {f'<@{r['to_user']}>' if r['to_user'] else 'SYSTEM'}\n"
+                        f"理由: {meta.get('reason') or '-'}"
+                    )
+                    await channel.send(embed=e)
+                    last_id = r["bank_transaction_id"]
+        except Exception:
+            logger.exception("movement log update failed")
+        await asyncio.sleep(15)
+
+
+async def update_bank_status():
+    channel_id = await get_setting("bank_status_channel_id", "0")
+    if not channel_id or channel_id == "0":
+        return
+    channel = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+    stats = await statistics()
+    rate = int(await get_setting("chip_rate_pal", "100"))
+    fee = int(await get_setting("exchange_fee_percent", "0"))
+    maintenance = await maintenance_enabled()
+    e = discord.Embed(
+        title="🏦 PAL BANK STATUS",
+        color=0xED4245 if maintenance else 0x57F287,
+    )
+    e.description = "🔴 **MAINTENANCE**" if maintenance else "🟢 **BANK ONLINE**"
+    e.add_field(name="交換レート", value=f"1 CHIP = **{rate:,} PAL**")
+    e.add_field(name="交換手数料", value=f"**{fee}%**")
+    e.add_field(name="口座ユーザー", value=f"**{stats['users']:,}人**")
+    e.add_field(name="24時間取引", value=f"**{stats['tx24']:,}件**")
+    e.set_footer(text="PAL BANK • 5分ごとに自動更新")
+    message_id = await get_setting("bank_status_message_id", "0")
+    if message_id and message_id != "0":
+        try:
+            msg = await channel.fetch_message(int(message_id))
+            await msg.edit(embed=e)
+            return
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+            pass
+    msg = await channel.send(embed=e)
+    await set_setting("bank_status_message_id", str(msg.id))
+
+
+async def bank_status_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await update_bank_status()
+        except Exception:
+            logger.exception("bank status update failed")
+        await asyncio.sleep(300)
+
 
 async def setup_fixed_panels():
     user_channel = os.getenv("BANK_PANEL_CHANNEL_ID")
@@ -146,6 +245,8 @@ async def on_ready():
     await restore_review_views()
     await setup_fixed_panels()
     bot.loop.create_task(ranking_loop())
+    bot.loop.create_task(movement_log_loop())
+    bot.loop.create_task(bank_status_loop())
 
     _ready_once = True
     logger.info("PAL BANK BOT起動完了: %s", bot.user)

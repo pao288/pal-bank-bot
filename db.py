@@ -170,6 +170,56 @@ async def _create_schema(conn: asyncpg.Connection) -> None:
     """)
 
 
+    await conn.execute("""
+    ALTER TABLE bank.transfer_requests
+        ADD COLUMN IF NOT EXISTS hold_transaction_id BIGINT,
+        ADD COLUMN IF NOT EXISTS warning_text TEXT;
+
+    CREATE TABLE IF NOT EXISTS bank.notifications (
+        notification_id BIGSERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        notification_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        is_read BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_bank_notifications_user
+        ON bank.notifications(user_id, is_read, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS bank.transaction_reversals (
+        reversal_id BIGSERIAL PRIMARY KEY,
+        original_transaction_id BIGINT NOT NULL REFERENCES bank.transactions(bank_transaction_id),
+        reversal_transaction_id BIGINT NOT NULL REFERENCES bank.transactions(bank_transaction_id),
+        reversed_by TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(original_transaction_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS bank.daily_stats (
+        stat_date DATE PRIMARY KEY,
+        completed_transactions BIGINT NOT NULL DEFAULT 0,
+        moved_pal BIGINT NOT NULL DEFAULT 0,
+        moved_chip BIGINT NOT NULL DEFAULT 0,
+        transfer_requests BIGINT NOT NULL DEFAULT 0,
+        approved_transfers BIGINT NOT NULL DEFAULT 0,
+        rejected_transfers BIGINT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    INSERT INTO bank.settings(setting_key, setting_value) VALUES
+        ('maintenance_mode','0'),
+        ('movement_log_channel_id','0'),
+        ('bank_status_channel_id','0'),
+        ('bank_status_message_id','0'),
+        ('large_transfer_warning_pal','100000'),
+        ('rapid_transfer_warning_count','5'),
+        ('rapid_transfer_warning_minutes','10')
+    ON CONFLICT(setting_key) DO NOTHING;
+    """)
+
+
 async def get_setting(key: str, default: str | None = None) -> str | None:
     pool = get_pool()
     async with pool.acquire() as conn:

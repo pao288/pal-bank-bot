@@ -12,6 +12,8 @@ async def bank_move(source_bot, reference_id, operation, user_id, currency, amou
     if operation not in ("CREDIT","DEBIT") or amount<=0: raise ValueError("operation/amount")
     async with _pool.acquire() as c:
       async with c.transaction():
+        maintenance=await c.fetchval("SELECT setting_value FROM bank.settings WHERE setting_key='maintenance_mode'")
+        if maintenance=="1": return {"status":"MAINTENANCE"}
         old=await c.fetchval("SELECT status FROM bank.integration_events WHERE source_bot=$1 AND external_reference_id=$2 FOR UPDATE",source_bot,reference_id)
         if old:return {"status":"ALREADY_PROCESSED","event_status":old}
         await c.execute("INSERT INTO bank.integration_events(source_bot,external_reference_id,operation,user_id,currency,amount,status) VALUES($1,$2,$3,$4,$5,$6,'PENDING')",source_bot,reference_id,operation,str(user_id),currency,amount)

@@ -38,7 +38,7 @@ async def rankings(limit=10):
     rate=int(await get_setting("chip_rate_pal","100"))
     pool=get_pool()
     async with pool.acquire() as c:
-        pal=await c.fetch("SELECT owner_id,balance FROM bank.accounts WHERE account_type='USER' AND currency='PAL' ORDER BY balance DESC LIMIT $1",limit)
-        chip=await c.fetch("SELECT owner_id,balance FROM bank.accounts WHERE account_type='USER' AND currency='CHIP' ORDER BY balance DESC LIMIT $1",limit)
-        total=await c.fetch("""SELECT owner_id,SUM(CASE WHEN currency='PAL' THEN balance ELSE balance*$1 END)::bigint balance FROM bank.accounts WHERE account_type='USER' GROUP BY owner_id ORDER BY balance DESC LIMIT $2""",rate,limit)
+        pal=await c.fetch("SELECT owner_id,balance FROM bank.accounts WHERE account_type='USER' AND currency='PAL' AND balance>0 ORDER BY balance DESC LIMIT $1",limit)
+        chip=await c.fetch("SELECT owner_id,balance FROM bank.accounts WHERE account_type='USER' AND currency='CHIP' AND balance>0 ORDER BY balance DESC LIMIT $1",limit)
+        total=await c.fetch("""SELECT owner_id,SUM(CASE WHEN currency='PAL' THEN balance ELSE balance*$1 END)::bigint balance FROM bank.accounts WHERE account_type='USER' GROUP BY owner_id HAVING SUM(CASE WHEN currency='PAL' THEN balance ELSE balance*$1 END)>0 ORDER BY balance DESC LIMIT $2""",rate,limit)
     return pal,chip,total
