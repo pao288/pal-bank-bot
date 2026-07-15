@@ -108,7 +108,7 @@ async def transfer_warning(requester_id: str, amount: int) -> str | None:
             """SELECT COUNT(*) FROM bank.transfer_requests
                WHERE requester_id=$1
                  AND created_at >= now() - ($2::text || ' minutes')::interval""",
-            requester_id, minutes,
+            requester_id, str(minutes),
         )
     if recent >= count_limit:
         warnings.append(f"{minutes}分以内の申請数: {recent + 1}件")
