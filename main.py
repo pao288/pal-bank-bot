@@ -21,6 +21,21 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 _ready_once = False
 
 
+# ===== !banksetup: PAL BANK カテゴリ／チャンネル／パネル 自動構築 =====
+BANK_CATEGORY_NAME = "🏦 PAL BANK"
+BANK_CATEGORY_SETTING_KEY = "pal_bank_category_id"
+
+# (設定キー, チャンネル名, トピック)
+# ranking_channel_id と movement_log_channel_id は既存機能（!rankingpanel /
+# 送金審査チャンネルON-OFFパネル等）と同じ設定キーを再利用し、同一チャンネルとして扱う。
+BANK_CHANNEL_DEFS = [
+    ("bank_panel_channel_id", "💰｜銀行", "PAL BANK｜残高確認・送金・交換などのバンクパネル"),
+    ("ranking_channel_id", "📊｜ランキング", "PAL BANK｜PAL・CHIP・総資産ランキング（自動更新）"),
+    ("movement_log_channel_id", "📜｜ログ", "PAL BANK｜通貨移動ログ"),
+    ("admin_panel_channel_id", "🛠｜管理", "PAL BANK｜管理者専用コンソール"),
+]
+
+
 def user_panel_embed() -> discord.Embed:
     embed = discord.Embed(
         title="🏦 PAL BANK｜DIGITAL WALLET",
@@ -92,6 +107,150 @@ async def ensure_fixed_panel(channel_id: int, kind: str):
     else:
         message = await channel.send(embed=admin_panel_embed(), view=AdminPanelView())
     await set_setting(key, str(message.id))
+
+
+def _bank_overwrites(guild: discord.Guild) -> dict:
+    # 一般ユーザー: 閲覧可能・送信不可 / BOTと管理者(Administrator権限保持者)は通常通り操作可能
+    return {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True, send_messages=False
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+            manage_messages=True,
+            embed_links=True,
+            add_reactions=True,
+        ),
+    }
+
+
+async def ensure_bank_category(guild: discord.Guild) -> discord.CategoryChannel:
+    overwrites = _bank_overwrites(guild)
+    category_id = await get_setting(BANK_CATEGORY_SETTING_KEY, "0")
+    category = None
+    if category_id and category_id != "0":
+        found = guild.get_channel(int(category_id))
+        if isinstance(found, discord.CategoryChannel):
+            category = found
+    if category is None:
+        # 既に存在するものは再利用（名前一致）、不足していれば新規作成
+        category = discord.utils.get(guild.categories, name=BANK_CATEGORY_NAME)
+    if category is None:
+        category = await guild.create_category(
+            BANK_CATEGORY_NAME, overwrites=overwrites, reason="PAL BANK setup"
+        )
+    else:
+        try:
+            await category.edit(overwrites=overwrites)
+        except discord.HTTPException:
+            logger.exception("カテゴリ権限更新失敗: %s", category.id)
+    await set_setting(BANK_CATEGORY_SETTING_KEY, str(category.id))
+    return category
+
+
+async def ensure_bank_channel(
+    guild: discord.Guild,
+    category: discord.CategoryChannel,
+    setting_key: str,
+    name: str,
+    topic: str,
+) -> discord.TextChannel:
+    overwrites = _bank_overwrites(guild)
+    channel_id = await get_setting(setting_key, "0")
+    channel = None
+    if channel_id and channel_id != "0":
+        found = guild.get_channel(int(channel_id))
+        if isinstance(found, discord.TextChannel):
+            channel = found
+    if channel is None:
+        # 既に存在するものは再利用（カテゴリ内の名前一致）、不足していれば新規作成
+        channel = discord.utils.get(category.text_channels, name=name)
+    if channel is None:
+        channel = await guild.create_text_channel(
+            name=name,
+            category=category,
+            topic=topic,
+            overwrites=overwrites,
+            reason="PAL BANK setup",
+        )
+    else:
+        try:
+            if channel.category_id != category.id:
+                await channel.edit(category=category, sync_permissions=False)
+            await channel.edit(overwrites=overwrites)
+        except discord.HTTPException:
+            logger.exception("チャンネル権限更新失敗: %s", channel.id)
+    await set_setting(setting_key, str(channel.id))
+    return channel
+
+
+async def refresh_panels(guild: discord.Guild) -> list[str]:
+    """既存チャンネルに対して、銀行パネル／ランキングパネル／管理パネルのみを再設置する。"""
+    posted = []
+
+    bank_channel_id = await get_setting("bank_panel_channel_id", "0")
+    if bank_channel_id and bank_channel_id != "0" and guild.get_channel(int(bank_channel_id)):
+        await ensure_fixed_panel(int(bank_channel_id), "user")
+        posted.append("💰 銀行パネル")
+
+    admin_channel_id = await get_setting("admin_panel_channel_id", "0")
+    if admin_channel_id and admin_channel_id != "0" and guild.get_channel(int(admin_channel_id)):
+        await ensure_fixed_panel(int(admin_channel_id), "admin")
+        posted.append("🛠 管理パネル")
+
+    ranking_channel_id = await get_setting("ranking_channel_id", "0")
+    if ranking_channel_id and ranking_channel_id != "0" and guild.get_channel(int(ranking_channel_id)):
+        await update_ranking()
+        posted.append("📊 ランキングパネル")
+
+    return posted
+
+
+async def ensure_bank_system(guild: discord.Guild):
+    """!banksetup 本体。既存のカテゴリ／チャンネルは再利用し、不足分のみ作成した上でパネルを設置する。
+    DB（残高・履歴・口座・ランキング等）には一切触れない。"""
+    category = await ensure_bank_category(guild)
+    channels = {}
+    for setting_key, name, topic in BANK_CHANNEL_DEFS:
+        channels[setting_key] = await ensure_bank_channel(guild, category, setting_key, name, topic)
+    await refresh_panels(guild)
+    return category, channels
+
+
+async def delete_bank_system(guild: discord.Guild) -> list[str]:
+    """Discord側（カテゴリ・チャンネル・パネル）のみを削除する。銀行DBのデータは一切削除しない。"""
+    deleted = []
+
+    for setting_key, name, _topic in BANK_CHANNEL_DEFS:
+        channel_id = await get_setting(setting_key, "0")
+        if channel_id and channel_id != "0":
+            channel = guild.get_channel(int(channel_id))
+            if channel is not None:
+                try:
+                    await channel.delete(reason="PAL BANK system delete (Discord側のみ)")
+                    deleted.append(name)
+                except discord.HTTPException:
+                    logger.exception("チャンネル削除失敗: %s", channel_id)
+        await set_setting(setting_key, "0")
+
+    category_id = await get_setting(BANK_CATEGORY_SETTING_KEY, "0")
+    if category_id and category_id != "0":
+        category = guild.get_channel(int(category_id))
+        if category is not None:
+            try:
+                await category.delete(reason="PAL BANK system delete (Discord側のみ)")
+                deleted.append(category.name)
+            except discord.HTTPException:
+                logger.exception("カテゴリ削除失敗: %s", category_id)
+    await set_setting(BANK_CATEGORY_SETTING_KEY, "0")
+
+    # パネルメッセージの追跡idもリセット（メッセージ自体はチャンネル削除で消滅済み）
+    for key in ("user_panel_message_id", "admin_panel_message_id", "ranking_message_id"):
+        await set_setting(key, "0")
+
+    return deleted
 
 
 async def restore_review_views():
@@ -278,9 +437,12 @@ async def rankingpanel(ctx: commands.Context):
     await ctx.send("✅ ランキングパネル設置完了",delete_after=5)
 
 
-@bot.command(name="banksetup")
+# 元々 !banksetup という名前だった個別チャンネルON/OFFトグル機能。
+# 新しい !banksetup（PAL BANKカテゴリ一式の自動構築）とコマンド名が重複するため、
+# 機能は一切変更せずに !bankchannels という名前へ変更のみ行っている。
+@bot.command(name="bankchannels")
 @commands.has_permissions(administrator=True)
-async def banksetup(ctx: commands.Context):
+async def bankchannels(ctx: commands.Context):
     embed = discord.Embed(title="⚙️ PAL BANK CHANNEL SETUP", color=0x2B2D31)
     embed.description = (
         "各ボタンは **ON / OFF式** です。\n"
@@ -289,6 +451,45 @@ async def banksetup(ctx: commands.Context):
         "同じ種類のチャンネルは1個だけ管理します。"
     )
     await ctx.send(embed=embed, view=BankSetupPanelView())
+
+
+@bot.command(name="banksetup")
+@commands.has_permissions(administrator=True)
+async def banksetup(ctx: commands.Context):
+    """🏦 PAL BANK カテゴリ・チャンネル（💰銀行/📊ランキング/📜ログ/🛠管理）・
+    各種パネルを一括で自動構築する。既に存在するものは再利用し、不足分のみ作成する。
+    再実行時はDiscord側で削除された部分のみ復元し、DBデータはそのまま利用する。"""
+    if ctx.guild is None:
+        await ctx.send("サーバー内で実行してください。", delete_after=5)
+        return
+
+    message = await ctx.send("🏦 PAL BANK システムをセットアップしています…")
+    try:
+        category, channels = await ensure_bank_system(ctx.guild)
+    except discord.Forbidden:
+        await message.edit(content="❌ 権限不足でチャンネル/カテゴリを作成できませんでした。BOTの権限を確認してください。")
+        return
+    except Exception:
+        logger.exception("banksetup failed")
+        await message.edit(content="❌ セットアップ中にエラーが発生しました。ログを確認してください。")
+        return
+
+    bank_ch = channels["bank_panel_channel_id"]
+    ranking_ch = channels["ranking_channel_id"]
+    log_ch = channels["movement_log_channel_id"]
+    admin_ch = channels["admin_panel_channel_id"]
+
+    await message.edit(
+        content=(
+            "✅ PAL BANK セットアップ完了！\n"
+            f"カテゴリ: **{category.name}**\n"
+            f"💰 銀行: {bank_ch.mention}\n"
+            f"📊 ランキング: {ranking_ch.mention}\n"
+            f"📜 ログ: {log_ch.mention}\n"
+            f"🛠 管理: {admin_ch.mention}\n\n"
+            "一般ユーザーは閲覧のみ可能（送信不可）、BOTと管理者は通常通り操作できます。"
+        )
+    )
 
 
 @bot.event

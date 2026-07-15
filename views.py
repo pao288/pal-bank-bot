@@ -690,7 +690,7 @@ class RequestAmountModal(discord.ui.Modal,title="💸 PAL送金申請"):
             ch=await get_setting("transfer_review_channel_id","0")
             if not ch or ch == "0":
                 await i.edit_original_response(
-                    content="送金審査チャンネルが未設定です。`!banksetup` からONにしてください。"
+                    content="送金審査チャンネルが未設定です。`!bankchannels` からONにしてください。"
                 )
                 return
 
@@ -1371,3 +1371,68 @@ class AdminPanelView(discord.ui.View):
             view=TransactionActionView(),
             ephemeral=True,
         )
+
+    @discord.ui.button(label="♻️ システム復旧", style=discord.ButtonStyle.success, custom_id="final_admin_bank_recover", row=2)
+    async def bank_system_recover(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        import main as _main  # 循環importを避けるため遅延import
+        category, channels = await _main.ensure_bank_system(interaction.guild)
+        lines = "\n".join(f"・{ch.mention}" for ch in channels.values())
+        await interaction.followup.send(
+            f"♻️ システムを復旧しました。\nカテゴリ: **{category.name}**\n{lines}\n"
+            f"（DBの残高・履歴・口座・ランキング等のデータはそのまま利用しています）",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="📢 パネル再設置", style=discord.ButtonStyle.primary, custom_id="final_admin_bank_repanel", row=2)
+    async def bank_system_repanel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        import main as _main  # 循環importを避けるため遅延import
+        posted = await _main.refresh_panels(interaction.guild)
+        text = "📢 パネルを再設置しました。\n" + "\n".join(f"・{p}" for p in posted) if posted else (
+            "対象のチャンネルが見つかりませんでした。先に `!banksetup` を実行してください。"
+        )
+        await interaction.followup.send(text, ephemeral=True)
+
+    @discord.ui.button(label="🗑 システム削除", style=discord.ButtonStyle.danger, custom_id="final_admin_bank_delete", row=2)
+    async def bank_system_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "⚠️ PAL BANKのカテゴリ・チャンネル・パネルをDiscord側から削除します。\n"
+            "銀行DB（残高・履歴・口座・ランキング等）は削除されません。\n"
+            "よろしいですか？",
+            view=SystemDeleteConfirmView(),
+            ephemeral=True,
+        )
+
+
+class SystemDeleteConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("管理者専用です。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="🗑 削除を実行", style=discord.ButtonStyle.danger, custom_id="bank_system_delete_confirm")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        import main as _main  # 循環importを避けるため遅延import
+        deleted = await _main.delete_bank_system(interaction.guild)
+        text = (
+            "✅ Discord側のカテゴリ・チャンネル・パネルを削除しました。\n"
+            "（銀行DBの残高・履歴・口座・ランキング等のデータは保持されています）\n"
+            + ("削除: " + ", ".join(deleted) if deleted else "削除対象は見つかりませんでした。")
+        )
+        await interaction.followup.send(text, ephemeral=True)
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary, custom_id="bank_system_delete_cancel")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("キャンセルしました。", ephemeral=True)
+        for child in self.children:
+            child.disabled = True
+        self.stop()
