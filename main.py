@@ -8,7 +8,7 @@ from discord.ext import commands
 from db import get_pool, get_setting, init_db_pool, set_setting
 from bank_services import rankings
 from bank_advanced import maintenance_enabled, statistics
-from views import AdminPanelView, BankPanelView, EnvelopeClaimView, ReviewView
+from views import AdminPanelView, BankPanelView, BankSetupPanelView, EnvelopeClaimView, ReviewView
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pal_bank")
@@ -241,6 +241,7 @@ async def on_ready():
 
     bot.add_view(BankPanelView())
     bot.add_view(AdminPanelView())
+    bot.add_view(BankSetupPanelView())
     await restore_envelope_views()
     await restore_review_views()
     await setup_fixed_panels()
@@ -275,6 +276,19 @@ async def rankingpanel(ctx: commands.Context):
     await set_setting("ranking_message_id","0")
     await update_ranking()
     await ctx.send("✅ ランキングパネル設置完了",delete_after=5)
+
+
+@bot.command(name="banksetup")
+@commands.has_permissions(administrator=True)
+async def banksetup(ctx: commands.Context):
+    embed = discord.Embed(title="⚙️ PAL BANK CHANNEL SETUP", color=0x2B2D31)
+    embed.description = (
+        "各ボタンは **ON / OFF式** です。\n"
+        "未作成なら専用テキストチャンネルを新規作成。\n"
+        "作成済みならその専用チャンネルを削除します。\n"
+        "同じ種類のチャンネルは1個だけ管理します。"
+    )
+    await ctx.send(embed=embed, view=BankSetupPanelView())
 
 
 @bot.event

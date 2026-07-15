@@ -776,7 +776,7 @@ class ReversalModal(discord.ui.Modal, title="↩️ 取引取消・返金"):
             await interaction.response.send_message(str(exc), ephemeral=True)
 
 
-class BankPanelView(BankPanelView):
+class UltimateBankPanelView(BankPanelView):
     @discord.ui.button(label="👤 BANKプロフィール", style=discord.ButtonStyle.primary, custom_id="ultimate_profile", row=2)
     async def bank_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
         p = await profile(str(interaction.user.id))
@@ -803,7 +803,7 @@ class BankPanelView(BankPanelView):
         await interaction.response.send_message(embed=e, ephemeral=True)
 
 
-class AdminPanelView(AdminPanelView):
+class UltimateAdminPanelView(AdminPanelView):
     def __init__(self):
         super().__init__()
         items = [
@@ -861,4 +861,212 @@ class AdminPanelView(AdminPanelView):
             "直近最大5,000件の取引CSVです。",
             file=discord.File(io.BytesIO(data), filename="pal_bank_transactions.csv"),
             ephemeral=True,
+        )
+
+
+# ===== CLEAN FINAL UI =====
+
+class CurrencyActionSelect(discord.ui.Select):
+    def __init__(self, currency: str):
+        self.currency = currency
+        super().__init__(
+            placeholder=f"{currency}の操作を選択",
+            options=[
+                discord.SelectOption(label=f"{currency}付与", value="GRANT", emoji="➕"),
+                discord.SelectOption(label=f"{currency}回収", value="TAKE", emoji="➖"),
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            f"{self.currency}の対象ユーザーを選択してください。",
+            view=AdminUserView(self.currency, self.values[0]),
+            ephemeral=True,
+        )
+
+
+class CurrencyActionView(discord.ui.View):
+    def __init__(self, currency: str):
+        super().__init__(timeout=120)
+        self.add_item(CurrencyActionSelect(currency))
+
+
+class TransactionActionSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="取引操作を選択",
+            options=[
+                discord.SelectOption(label="取引確認", value="HISTORY", emoji="📖"),
+                discord.SelectOption(label="取引検索", value="SEARCH", emoji="🔎"),
+                discord.SelectOption(label="取引返金・取消", value="REVERSAL", emoji="↩️"),
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        action = self.values[0]
+        if action == "HISTORY":
+            rows = await get_all_history(100)
+            await interaction.response.send_message(
+                embed=history_embed("📖 BANK TRANSACTION HISTORY", rows),
+                ephemeral=True,
+            )
+        elif action == "SEARCH":
+            await interaction.response.send_modal(TransactionSearchModal())
+        else:
+            await interaction.response.send_modal(ReversalModal())
+
+
+class TransactionActionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(TransactionActionSelect())
+
+
+class BankPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="👤 BANKプロフィール", style=discord.ButtonStyle.primary, custom_id="clean_profile", row=0)
+    async def bank_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = await profile(str(interaction.user.id))
+        e = bank_embed("💳 PAL BANK PROFILE", color=PAL_GOLD)
+        e.add_field(name="💰 PAL残高", value=f"**{p['PAL']:,} PAL**", inline=True)
+        e.add_field(name="🎰 CHIP残高", value=f"**{p['CHIP']:,} CHIP**", inline=True)
+        e.add_field(name="🔓 利用可能PAL", value=f"**{p['available_pal']:,} PAL**", inline=True)
+        e.add_field(name="⏳ 審査中PAL", value=f"**{p['pending_pal']:,} PAL**", inline=True)
+        e.add_field(name="🏆 総資産", value=f"**{p['asset_pal']:,} PAL換算**", inline=True)
+        e.add_field(name="📊 資産順位", value=f"**#{p['rank']}**", inline=True)
+        e.add_field(name="🔔 未読通知", value=f"**{p['unread']}件**", inline=True)
+        if p["created_at"]:
+            e.set_footer(text=f"口座開設: {p['created_at']:%Y-%m-%d} • 1 CHIP = {p['rate']:,} PAL")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="💸 送金申請", style=discord.ButtonStyle.secondary, custom_id="clean_transfer", row=0)
+    async def transfer_request(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("送金相手を選択してください。", view=RequestUserView(), ephemeral=True)
+
+    @discord.ui.button(label="🔄 通貨交換", style=discord.ButtonStyle.primary, custom_id="clean_exchange", row=0)
+    async def exchange_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rate = await get_setting("chip_rate_pal", "100")
+        fee = await get_setting("exchange_fee_percent", "0")
+        minimum = await get_setting("exchange_min_pal", "1000")
+        await interaction.response.send_message(
+            f"**1 CHIP = {int(rate):,} PAL｜手数料 {fee}%｜最低 {int(minimum):,} PAL**",
+            view=ExchangeView2(),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="📖 取引履歴", style=discord.ButtonStyle.secondary, custom_id="clean_history", row=1)
+    async def history(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = str(interaction.user.id)
+        rows = await get_history(uid, 100)
+        await interaction.response.send_message(
+            embed=history_embed("📖 TRANSACTION HISTORY", rows, uid),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🔔 通知", style=discord.ButtonStyle.secondary, custom_id="clean_notifications", row=1)
+    async def notifications(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rows = await get_notifications(str(interaction.user.id), 10)
+        e = bank_embed("🔔 BANK NOTIFICATIONS", color=PAL_DARK)
+        e.description = "\n\n".join(
+            f"{'🔵' if not r['is_read'] else '⚪'} **{r['title']}**\n{r['body']}" for r in rows
+        ) if rows else "通知はありません。"
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="🧧 ポチ袋", style=discord.ButtonStyle.secondary, custom_id="clean_envelope", row=1)
+    async def envelope(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EnvelopeModal())
+
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("管理者専用です。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="💰 PAL付与・回収", style=discord.ButtonStyle.primary, custom_id="clean_admin_pal", row=0)
+    async def pal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("PALの操作を選択してください。", view=CurrencyActionView("PAL"), ephemeral=True)
+
+    @discord.ui.button(label="🎰 CHIP付与・回収", style=discord.ButtonStyle.primary, custom_id="clean_admin_chip", row=0)
+    async def chip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("CHIPの操作を選択してください。", view=CurrencyActionView("CHIP"), ephemeral=True)
+
+    @discord.ui.button(label="👤 ユーザー残高確認", style=discord.ButtonStyle.secondary, custom_id="clean_admin_balance", row=0)
+    async def balance(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("確認するユーザーを選択してください。", view=AdminUserView("PAL", "BALANCE"), ephemeral=True)
+
+    @discord.ui.button(label="🏦 総通貨", style=discord.ButtonStyle.secondary, custom_id="clean_admin_totals", row=1)
+    async def total_currency(self, interaction: discord.Interaction, button: discord.ui.Button):
+        x = await totals()
+        await interaction.response.send_message(
+            f"💰 **PAL総量 {x['PAL']:,} PAL**\n🎰 **CHIP総量 {x['CHIP']:,} CHIP**",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🔄 交換設定", style=discord.ButtonStyle.secondary, custom_id="clean_admin_exchange", row=1)
+    async def exchange_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SettingsModal())
+
+    @discord.ui.button(label="📖 取引管理", style=discord.ButtonStyle.secondary, custom_id="clean_admin_transactions", row=1)
+    async def transactions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("取引操作を選択してください。", view=TransactionActionView(), ephemeral=True)
+
+
+async def _toggle_managed_channel(interaction: discord.Interaction, setting_key: str, name: str, topic: str):
+    guild = interaction.guild
+    existing_id = await get_setting(setting_key, "0")
+
+    if existing_id and existing_id != "0":
+        channel = guild.get_channel(int(existing_id))
+        if channel is not None:
+            await set_setting(setting_key, "0")
+            await interaction.response.send_message(f"🗑️ {channel.mention} を削除します。", ephemeral=True)
+            await channel.delete(reason=f"PAL BANK managed channel toggle by {interaction.user}")
+            return
+        await set_setting(setting_key, "0")
+
+    channel = await guild.create_text_channel(
+        name=name,
+        topic=topic,
+        reason=f"PAL BANK managed channel created by {interaction.user}",
+    )
+    await set_setting(setting_key, str(channel.id))
+    await interaction.response.send_message(f"✅ {channel.mention} を作成しました。", ephemeral=True)
+
+
+class BankSetupPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("管理者専用です。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="💸 送金審査チャンネル ON / OFF", style=discord.ButtonStyle.primary, custom_id="setup_review_channel", row=0)
+    async def review_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _toggle_managed_channel(
+            interaction, "transfer_review_channel_id",
+            "pal-送金審査", "PAL BANK｜送金申請の許可・却下を行うチャンネル",
+        )
+
+    @discord.ui.button(label="📜 通貨移動ログ ON / OFF", style=discord.ButtonStyle.secondary, custom_id="setup_log_channel", row=1)
+    async def movement_log(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _toggle_managed_channel(
+            interaction, "movement_log_channel_id",
+            "pal-通貨移動ログ", "PAL BANK｜SEND・SHOP・CASINO・VOICE・ADMIN・BANK通貨移動ログ",
+        )
+
+    @discord.ui.button(label="🟢 BANKステータス ON / OFF", style=discord.ButtonStyle.secondary, custom_id="setup_status_channel", row=2)
+    async def bank_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _toggle_managed_channel(
+            interaction, "bank_status_channel_id",
+            "pal-bank-status", "PAL BANK｜稼働状況・交換レート・手数料・口座数・24時間取引",
         )
