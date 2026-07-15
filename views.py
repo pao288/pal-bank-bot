@@ -508,7 +508,14 @@ class AdminAmountModal(discord.ui.Modal):
             await interaction.response.send_message("1以上の数字を入力してください。", ephemeral=True)
             return
 
+        await ensure_user_accounts(str(self.target.id))
         account_id = await get_user_account_id(str(self.target.id), self.currency)
+        if account_id is None:
+            await interaction.response.send_message(
+                "対象ユーザーの口座を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
         key = f"ADMIN_{self.action}:{interaction.id}:{uuid.uuid4()}"
 
         try:
@@ -866,29 +873,39 @@ class UltimateAdminPanelView(AdminPanelView):
 
 # ===== CLEAN FINAL UI =====
 
-class CurrencyActionSelect(discord.ui.Select):
-    def __init__(self, currency: str):
-        self.currency = currency
-        super().__init__(
-            placeholder=f"{currency}の操作を選択",
-            options=[
-                discord.SelectOption(label=f"{currency}付与", value="GRANT", emoji="➕"),
-                discord.SelectOption(label=f"{currency}回収", value="TAKE", emoji="➖"),
-            ],
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            f"{self.currency}の対象ユーザーを選択してください。",
-            view=AdminUserView(self.currency, self.values[0]),
-            ephemeral=True,
-        )
-
-
 class CurrencyActionView(discord.ui.View):
     def __init__(self, currency: str):
         super().__init__(timeout=120)
-        self.add_item(CurrencyActionSelect(currency))
+        self.currency = currency
+
+        grant = discord.ui.Button(
+            label=f"{currency}付与",
+            emoji="➕",
+            style=discord.ButtonStyle.success,
+        )
+        take = discord.ui.Button(
+            label=f"{currency}回収",
+            emoji="➖",
+            style=discord.ButtonStyle.danger,
+        )
+
+        grant.callback = self.grant_callback
+        take.callback = self.take_callback
+
+        self.add_item(grant)
+        self.add_item(take)
+
+    async def grant_callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=f"{self.currency}を付与するユーザーを選択してください。",
+            view=AdminTargetView("MONEY", self.currency, "GRANT"),
+        )
+
+    async def take_callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=f"{self.currency}を回収するユーザーを選択してください。",
+            view=AdminTargetView("MONEY", self.currency, "TAKE"),
+        )
 
 
 class TransactionActionSelect(discord.ui.Select):
@@ -999,7 +1016,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="👤 ユーザー残高確認", style=discord.ButtonStyle.secondary, custom_id="clean_admin_balance", row=0)
     async def balance(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("確認するユーザーを選択してください。", view=AdminUserView("PAL", "BALANCE"), ephemeral=True)
+        await interaction.response.send_message("確認するユーザーを選択してください。", view=AdminTargetView("BALANCE"), ephemeral=True)
 
     @discord.ui.button(label="🏦 総通貨", style=discord.ButtonStyle.secondary, custom_id="clean_admin_totals", row=1)
     async def total_currency(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1069,4 +1086,226 @@ class BankSetupPanelView(discord.ui.View):
         await _toggle_managed_channel(
             interaction, "bank_status_channel_id",
             "pal-bank-status", "PAL BANK｜稼働状況・交換レート・手数料・口座数・24時間取引",
+        )
+
+
+# ===== REBUILT ADMIN USER FLOW =====
+
+class CleanAdminAmountModal(discord.ui.Modal):
+    amount = discord.ui.TextInput(
+        label="金額",
+        placeholder="例: 10000",
+        max_length=18,
+    )
+    reason = discord.ui.TextInput(
+        label="理由",
+        placeholder="例: イベント景品 / 補填 / 調整",
+        max_length=100,
+    )
+
+    def __init__(self, target: discord.Member, currency: str, action: str):
+        title_action = "付与" if action == "GRANT" else "回収"
+        super().__init__(title=f"{currency}{title_action}")
+        self.target = target
+        self.currency = currency
+        self.action = action
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            amount = int(str(self.amount).replace(",", "").strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message(
+                "金額は1以上の整数で入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        user_id = str(self.target.id)
+        await ensure_user_accounts(user_id)
+        account_id = await get_user_account_id(user_id, self.currency)
+
+        if account_id is None:
+            await interaction.response.send_message(
+                "対象ユーザーの口座取得に失敗しました。",
+                ephemeral=True,
+            )
+            return
+
+        key = f"ADMIN_{self.action}:{interaction.id}:{uuid.uuid4()}"
+
+        try:
+            if self.action == "GRANT":
+                await transfer(
+                    idempotency_key=key,
+                    transaction_type="ADMIN_GRANT",
+                    currency=self.currency,
+                    from_account_id=None,
+                    to_account_id=account_id,
+                    amount=amount,
+                    external_bot="ADMIN",
+                    external_reference_id=key,
+                    metadata={
+                        "admin_id": str(interaction.user.id),
+                        "target_id": user_id,
+                        "reason": str(self.reason),
+                        "public_tx_id": f"ADMIN-{interaction.id}",
+                    },
+                )
+                action_text = "付与"
+            else:
+                await transfer(
+                    idempotency_key=key,
+                    transaction_type="ADMIN_TAKE",
+                    currency=self.currency,
+                    from_account_id=account_id,
+                    to_account_id=None,
+                    amount=amount,
+                    external_bot="ADMIN",
+                    external_reference_id=key,
+                    metadata={
+                        "admin_id": str(interaction.user.id),
+                        "target_id": user_id,
+                        "reason": str(self.reason),
+                        "public_tx_id": f"ADMIN-{interaction.id}",
+                    },
+                )
+                action_text = "回収"
+
+        except InsufficientBalanceError:
+            balances = await get_user_balances(user_id)
+            await interaction.response.send_message(
+                f"{self.target.mention} の {self.currency} 残高が足りません。\n"
+                f"現在残高: **{balances[self.currency]:,} {self.currency}**",
+                ephemeral=True,
+            )
+            return
+        except Exception as exc:
+            await interaction.response.send_message(
+                f"管理処理エラー: `{type(exc).__name__}`\n`{str(exc)[:500]}`",
+                ephemeral=True,
+            )
+            return
+
+        balances = await get_user_balances(user_id)
+        await interaction.response.send_message(
+            f"✅ {self.target.mention} に **{amount:,} {self.currency}** を{action_text}しました。\n"
+            f"現在残高: **{balances[self.currency]:,} {self.currency}**\n"
+            f"理由: {self.reason}",
+            ephemeral=True,
+        )
+
+
+class CleanAdminUserSelect(discord.ui.UserSelect):
+    def __init__(self, mode: str, currency: str | None = None, action: str | None = None):
+        super().__init__(
+            placeholder="対象ユーザーを選択",
+            min_values=1,
+            max_values=1,
+        )
+        self.mode = mode
+        self.currency = currency
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction):
+        target = self.values[0]
+
+        if self.mode == "BALANCE":
+            await ensure_user_accounts(str(target.id))
+            balances = await get_user_balances(str(target.id))
+            e = bank_embed("👤 USER BALANCE", color=PAL_DARK)
+            e.description = f"{target.mention}"
+            e.add_field(name="💰 PAL", value=f"**{balances['PAL']:,} PAL**", inline=True)
+            e.add_field(name="🎰 CHIP", value=f"**{balances['CHIP']:,} CHIP**", inline=True)
+            await interaction.response.edit_message(
+                content=None,
+                embed=e,
+                view=None,
+            )
+            return
+
+        await interaction.response.send_modal(
+            CleanAdminAmountModal(target, self.currency, self.action)
+        )
+
+
+class CleanAdminUserView(discord.ui.View):
+    def __init__(self, mode: str, currency: str | None = None, action: str | None = None):
+        super().__init__(timeout=180)
+        self.add_item(CleanAdminUserSelect(mode, currency, action))
+
+
+class CleanCurrencyActionView(discord.ui.View):
+    def __init__(self, currency: str):
+        super().__init__(timeout=180)
+        self.currency = currency
+
+    @discord.ui.button(label="➕ 付与", style=discord.ButtonStyle.success)
+    async def grant(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"{self.currency}を付与するユーザーを選択してください。",
+            view=CleanAdminUserView("MONEY", self.currency, "GRANT"),
+        )
+
+    @discord.ui.button(label="➖ 回収", style=discord.ButtonStyle.danger)
+    async def take(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=f"{self.currency}を回収するユーザーを選択してください。",
+            view=CleanAdminUserView("MONEY", self.currency, "TAKE"),
+        )
+
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("管理者専用です。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="💰 PAL付与・回収", style=discord.ButtonStyle.primary, custom_id="final_admin_pal", row=0)
+    async def pal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "PALの操作を選択してください。",
+            view=CleanCurrencyActionView("PAL"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🎰 CHIP付与・回収", style=discord.ButtonStyle.primary, custom_id="final_admin_chip", row=0)
+    async def chip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "CHIPの操作を選択してください。",
+            view=CleanCurrencyActionView("CHIP"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="👤 ユーザー残高確認", style=discord.ButtonStyle.secondary, custom_id="final_admin_balance", row=0)
+    async def balance(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "確認するユーザーを選択してください。",
+            view=CleanAdminUserView("BALANCE"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🏦 総通貨", style=discord.ButtonStyle.secondary, custom_id="final_admin_totals", row=1)
+    async def total_currency(self, interaction: discord.Interaction, button: discord.ui.Button):
+        x = await totals()
+        await interaction.response.send_message(
+            f"💰 **PAL総量 {x['PAL']:,} PAL**\n🎰 **CHIP総量 {x['CHIP']:,} CHIP**",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🔄 交換設定", style=discord.ButtonStyle.secondary, custom_id="final_admin_exchange", row=1)
+    async def exchange_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SettingsModal())
+
+    @discord.ui.button(label="📖 取引管理", style=discord.ButtonStyle.secondary, custom_id="final_admin_transactions", row=1)
+    async def transactions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "取引操作を選択してください。",
+            view=TransactionActionView(),
+            ephemeral=True,
         )

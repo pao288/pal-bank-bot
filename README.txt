@@ -39,3 +39,10 @@ OFF:
 Railway
 DISCORD_TOKEN
 DATABASE_URL
+
+
+ADMIN USER FLOW REBUILT
+PAL付与/回収・CHIP付与/回収・ユーザー残高確認は
+CleanAdminUserSelect に統一。
+旧AdminTargetView経路を管理パネルから使用しない。
+実行時例外はDiscordのephemeralメッセージへ型名と本文を表示。
