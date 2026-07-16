@@ -127,8 +127,9 @@ async def get_history(user_id: str, limit: int = 100) -> list:
         )
 
 
-async def get_all_history(limit: int = 100) -> list:
+async def get_all_history(limit: int = 100, guild_id=None) -> list:
     pool = get_pool()
+    prefix = f"{guild_id}:%" if guild_id is not None else "%"
     async with pool.acquire() as conn:
         return await conn.fetch(
             """
@@ -139,8 +140,10 @@ async def get_all_history(limit: int = 100) -> list:
             FROM bank.transactions t
             LEFT JOIN bank.accounts fa ON fa.account_id=t.from_account_id
             LEFT JOIN bank.accounts ta ON ta.account_id=t.to_account_id
+            WHERE (fa.owner_id LIKE $2 OR ta.owner_id LIKE $2)
             ORDER BY t.bank_transaction_id DESC
             LIMIT $1
             """,
             limit,
+            prefix,
         )

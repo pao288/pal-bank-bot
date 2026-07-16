@@ -7,7 +7,7 @@ from discord.ext import commands
 
 from db import get_pool, get_setting, init_db_pool, set_setting
 from bank_services import rankings
-from bank_advanced import maintenance_enabled, statistics
+from bank_advanced import maintenance_enabled, statistics, claim_legacy_data
 from views import AdminPanelView, BankPanelView, BankSetupPanelView, EnvelopeClaimView, ReviewView
 
 logging.basicConfig(level=logging.INFO)
@@ -451,6 +451,25 @@ async def bankchannels(ctx: commands.Context):
         "同じ種類のチャンネルは1個だけ管理します。"
     )
     await ctx.send(embed=embed, view=BankSetupPanelView())
+
+
+@bot.command(name="bankmigrate")
+@commands.has_permissions(administrator=True)
+async def bankmigrate(ctx: commands.Context):
+    """【重要・1度だけ実行】サーバーごとの残高分離を導入する前の残高・設定を、
+    このサーバー専用のものとして引き継ぐ。本鯖で1回だけ実行してください。
+    別サーバー（テスト鯖など）では実行しないでください（実行すると0からのスタートになります）。"""
+    if ctx.guild is None:
+        await ctx.send("サーバー内で実行してください。", delete_after=5)
+        return
+    result = await claim_legacy_data(ctx.guild.id)
+    await ctx.send(
+        "✅ レガシーデータ（サーバー分離前の残高・設定）をこのサーバー専用として引き継ぎました。\n"
+        f"引き継いだ口座数: {result['accounts']}件\n"
+        f"引き継いだSYSTEM口座数: {result['system_accounts']}件\n"
+        f"引き継いだ設定数: {result['settings']}件\n\n"
+        "⚠️ このコマンドは他のサーバーでは実行しないでください（実行すると0からのスタートになります）。"
+    )
 
 
 @bot.command(name="banksetup")

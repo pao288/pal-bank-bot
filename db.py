@@ -220,17 +220,31 @@ async def _create_schema(conn: asyncpg.Connection) -> None:
     """)
 
 
-async def get_setting(key: str, default: str | None = None) -> str | None:
+def _scoped_key(guild_id, key: str) -> str:
+    """設定がサーバー間で混ざらないよう、guild_idを設定キーに埋め込む。
+    guild_id=Noneの場合は旧来のグローバルキーのまま（後方互換用、!bankmigrate前など）。"""
+    if guild_id is None:
+        return key
+    return f"{guild_id}:{key}"
+
+
+async def get_setting(key: str, default: str | None = None, guild_id=None) -> str | None:
     pool = get_pool()
     async with pool.acquire() as conn:
         value = await conn.fetchval(
             "SELECT setting_value FROM bank.settings WHERE setting_key=$1",
-            key,
+            _scoped_key(guild_id, key),
         )
+        if value is None and guild_id is not None:
+            # サーバー専用の設定がまだ無い場合、既存のグローバル設定（移行前の値）にフォールバックする。
+            value = await conn.fetchval(
+                "SELECT setting_value FROM bank.settings WHERE setting_key=$1",
+                key,
+            )
     return value if value is not None else default
 
 
-async def set_setting(key: str, value: str) -> None:
+async def set_setting(key: str, value: str, guild_id=None) -> None:
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -240,6 +254,6 @@ async def set_setting(key: str, value: str) -> None:
             ON CONFLICT(setting_key)
             DO UPDATE SET setting_value=EXCLUDED.setting_value, updated_at=now()
             """,
-            key,
+            _scoped_key(guild_id, key),
             value,
         )

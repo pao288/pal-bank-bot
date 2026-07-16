@@ -1,6 +1,23 @@
 from db import get_pool
 
 
+def scope(guild_id, raw_id) -> str:
+    """サーバー間で残高が混ざらないよう、guild_idを埋め込んだキーを作る。
+    例: scope(123456789, 987654321) -> "123456789:987654321" """
+    return f"{guild_id}:{raw_id}"
+
+
+def unscope(scoped_id: str) -> str:
+    """scope()で作ったキーから元のuser_id部分だけを取り出す（表示用）。
+    まだ移行(!bankmigrate)されていない旧形式のキーはそのまま返す。"""
+    if scoped_id and ":" in scoped_id:
+        return scoped_id.split(":", 1)[1]
+    return scoped_id
+
+
+# 以降の関数はすべて「guild_idで既にスコープ済みのuser_idキー」を受け取る前提。
+# （呼び出し側で scope(guild_id, user.id) してから渡すこと）
+
 async def ensure_user_accounts(user_id: str) -> None:
     pool = get_pool()
     async with pool.acquire() as conn:

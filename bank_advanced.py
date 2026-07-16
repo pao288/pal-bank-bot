@@ -3,18 +3,18 @@ import io
 import uuid
 from datetime import datetime, timezone
 
-from accounts import ensure_user_accounts
+from accounts import ensure_user_accounts, unscope
 from db import get_pool, get_setting
 from transactions import InsufficientBalanceError
 
 
-async def maintenance_enabled() -> bool:
-    return await get_setting("maintenance_mode", "0") == "1"
+async def maintenance_enabled(guild_id=None) -> bool:
+    return await get_setting("maintenance_mode", "0", guild_id=guild_id) == "1"
 
 
-async def set_maintenance(enabled: bool) -> None:
+async def set_maintenance(enabled: bool, guild_id=None) -> None:
     from db import set_setting
-    await set_setting("maintenance_mode", "1" if enabled else "0")
+    await set_setting("maintenance_mode", "1" if enabled else "0", guild_id=guild_id)
 
 
 async def add_notification(user_id: str, kind: str, title: str, body: str) -> None:
@@ -52,10 +52,11 @@ async def unread_count(user_id: str) -> int:
         )
 
 
-async def profile(user_id: str) -> dict:
+async def profile(user_id: str, guild_id=None) -> dict:
     await ensure_user_accounts(user_id)
-    rate = int(await get_setting("chip_rate_pal", "100"))
+    rate = int(await get_setting("chip_rate_pal", "100", guild_id=guild_id))
     pool = get_pool()
+    prefix = f"{guild_id}:%" if guild_id is not None else "%"
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT currency,balance,created_at FROM bank.accounts WHERE account_type='USER' AND owner_id=$1",
@@ -64,19 +65,19 @@ async def profile(user_id: str) -> dict:
         pending = await conn.fetchval(
             """SELECT COALESCE(SUM(amount),0)::bigint FROM bank.transfer_requests
                WHERE requester_id=$1 AND status='PENDING'""",
-            user_id,
+            unscope(user_id),
         )
         rank = await conn.fetchval(
             """WITH assets AS (
                  SELECT owner_id,
                  SUM(CASE WHEN currency='PAL' THEN balance ELSE balance*$1 END)::bigint asset
-                 FROM bank.accounts WHERE account_type='USER'
+                 FROM bank.accounts WHERE account_type='USER' AND owner_id LIKE $3
                  GROUP BY owner_id
                ), ranked AS (
                  SELECT owner_id,DENSE_RANK() OVER(ORDER BY asset DESC) AS rank FROM assets
                )
                SELECT rank FROM ranked WHERE owner_id=$2""",
-            rate, user_id,
+            rate, user_id, prefix,
         )
     balances = {"PAL": 0, "CHIP": 0}
     created = None
@@ -91,7 +92,7 @@ async def profile(user_id: str) -> dict:
         "rank": rank or 0,
         "created_at": created,
         "rate": rate,
-        "unread": await unread_count(user_id),
+        "unread": await unread_count(unscope(user_id)),
     }
 
 
@@ -128,15 +129,15 @@ async def duplicate_pending(requester_id: str, recipient_id: str, amount: int):
         )
 
 
-async def atomic_exchange(user_id: str, direction: str, amount: int) -> tuple[int, str, int, str, str]:
-    if await maintenance_enabled():
+async def atomic_exchange(user_id: str, direction: str, amount: int, guild_id=None) -> tuple[int, str, int, str, str]:
+    if await maintenance_enabled(guild_id=guild_id):
         raise ValueError("BANKはメンテナンスモード中です。")
     await ensure_user_accounts(user_id)
     if amount <= 0:
         raise ValueError("1以上で入力してください。")
-    rate = int(await get_setting("chip_rate_pal", "100"))
-    fee_pct = int(await get_setting("exchange_fee_percent", "0"))
-    minimum = int(await get_setting("exchange_min_pal", "1000"))
+    rate = int(await get_setting("chip_rate_pal", "100", guild_id=guild_id))
+    fee_pct = int(await get_setting("exchange_fee_percent", "0", guild_id=guild_id))
+    minimum = int(await get_setting("exchange_min_pal", "1000", guild_id=guild_id))
     pool = get_pool()
     tx_code = f"PAL-{datetime.now(timezone.utc):%Y%m%d}-{uuid.uuid4().hex[:8].upper()}"
 
@@ -296,6 +297,38 @@ async def reverse_transaction(transaction_id: int, admin_id: str, reason: str) -
     return code
 
 
+async def claim_legacy_data(guild_id) -> dict:
+    """サーバー分離（guild_idスコープ）を導入する前の残高・設定を、このサーバーの物として引き継ぐ。
+    1度だけ実行することを想定（既にスコープ済み＝":"を含むキーは対象外なので、複数回実行しても安全）。"""
+    pool = get_pool()
+    prefix = f"{guild_id}:"
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            accounts = await conn.execute(
+                """UPDATE bank.accounts SET owner_id=$1||owner_id
+                   WHERE account_type='USER' AND owner_id NOT LIKE '%:%'""",
+                prefix,
+            )
+            system_accounts = await conn.execute(
+                """UPDATE bank.accounts SET account_key=$1||account_key
+                   WHERE account_type='SYSTEM' AND account_key NOT LIKE '%:%'""",
+                prefix,
+            )
+            settings = await conn.execute(
+                """UPDATE bank.settings SET setting_key=$1||setting_key
+                   WHERE setting_key NOT LIKE '%:%'""",
+                prefix,
+            )
+    def _count(tag: str) -> int:
+        try: return int(tag.split()[-1])
+        except (ValueError, IndexError): return 0
+    return {
+        "accounts": _count(accounts),
+        "system_accounts": _count(system_accounts),
+        "settings": _count(settings),
+    }
+
+
 async def csv_export_bytes() -> bytes:
     rows = await search_transactions(limit=5000)
     output = io.StringIO()
@@ -310,3 +343,73 @@ async def csv_export_bytes() -> bytes:
             r["created_at"].isoformat(), meta.get("public_tx_id",""), meta.get("reason",""),
         ])
     return output.getvalue().encode("utf-8-sig")
+
+
+async def confiscate_user(scoped_user_id: str, admin_id: str, currency: str | None = None) -> dict:
+    """指定したユーザー（このサーバー内）の残高を全没収する。currency未指定ならPAL/CHIP両方。
+    金額は消滅するのではなく、監査用に取引履歴として記録される（from側のみ、to側なし）。"""
+    pool = get_pool()
+    currencies = [currency.upper()] if currency else ["PAL", "CHIP"]
+    seized = {"PAL": 0, "CHIP": 0}
+    code = f"PAL-{datetime.now(timezone.utc):%Y%m%d}-{uuid.uuid4().hex[:8].upper()}"
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for cur in currencies:
+                acc = await conn.fetchrow(
+                    """SELECT account_id,balance FROM bank.accounts
+                       WHERE account_type='USER' AND owner_id=$1 AND currency=$2 FOR UPDATE""",
+                    scoped_user_id, cur,
+                )
+                if not acc or acc["balance"] <= 0:
+                    continue
+                amount = acc["balance"]
+                await conn.execute(
+                    "UPDATE bank.accounts SET balance=0,updated_at=now() WHERE account_id=$1",
+                    acc["account_id"],
+                )
+                await conn.execute(
+                    """INSERT INTO bank.transactions(
+                        idempotency_key,transaction_type,currency,from_account_id,to_account_id,
+                        amount,external_bot,external_reference_id,status,metadata,completed_at
+                       ) VALUES($1,'ADMIN_CONFISCATE',$2,$3,NULL,$4,'ADMIN',$5,'COMPLETED',
+                         jsonb_build_object('public_tx_id',$5::text,'admin_id',$6::text,'target_user',$7::text),now())""",
+                    f"CONFISCATE:{code}:{cur}", cur, acc["account_id"], amount, code, admin_id, scoped_user_id,
+                )
+                seized[cur] = amount
+    return seized
+
+
+async def confiscate_all(guild_id, admin_id: str, currency: str | None = None) -> dict:
+    """このサーバー内の全ユーザーの残高を一括没収する。currency未指定ならPAL/CHIP両方。
+    ユーザーごとに監査用の取引履歴が残る（from側のみ、to側なし）。"""
+    pool = get_pool()
+    currencies = [currency.upper()] if currency else ["PAL", "CHIP"]
+    prefix = f"{guild_id}:%"
+    code = f"PAL-{datetime.now(timezone.utc):%Y%m%d}-{uuid.uuid4().hex[:8].upper()}"
+    seized = {"PAL": 0, "CHIP": 0}
+    affected_users = set()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for cur in currencies:
+                rows = await conn.fetch(
+                    """SELECT account_id,owner_id,balance FROM bank.accounts
+                       WHERE account_type='USER' AND currency=$1 AND owner_id LIKE $2 AND balance>0
+                       FOR UPDATE""",
+                    cur, prefix,
+                )
+                for acc in rows:
+                    await conn.execute(
+                        "UPDATE bank.accounts SET balance=0,updated_at=now() WHERE account_id=$1",
+                        acc["account_id"],
+                    )
+                    await conn.execute(
+                        """INSERT INTO bank.transactions(
+                            idempotency_key,transaction_type,currency,from_account_id,to_account_id,
+                            amount,external_bot,external_reference_id,status,metadata,completed_at
+                           ) VALUES($1,'ADMIN_CONFISCATE_ALL',$2,$3,NULL,$4,'ADMIN',$5,'COMPLETED',
+                             jsonb_build_object('public_tx_id',$5::text,'admin_id',$6::text,'target_user',$7::text),now())""",
+                        f"CONFISCATE_ALL:{code}:{acc['account_id']}", cur, acc["account_id"], acc["balance"], code, admin_id, acc["owner_id"],
+                    )
+                    seized[cur] += acc["balance"]
+                    affected_users.add(acc["owner_id"])
+    return {"seized": seized, "code": code, "affected_accounts": len(affected_users)}
